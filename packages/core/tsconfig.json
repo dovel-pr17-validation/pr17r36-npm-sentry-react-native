@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.build.json",
+  "include": [
+    "src/js/tools/**/*.ts",
+    "src/js/*.ts",
+    "src/js/playground/*.ts",
+    "src/js/playground/*.tsx",
+    "src/js/**/*.web.ts",
+    "src/js/**/*.web.tsx",
+    "src/js/*.tsx",
+    "test/**/*.ts",
+    "test/**/*.tsx",
+    "typings/*.d.ts",
+    "plugin/**/*.ts"
+  ],
+  "exclude": ["dist"],
+  "compilerOptions": {
+    "rootDir": ".",
+    "jsx": "react",
+    "types": ["jest"],
+    // Jest compiles with this config. Keep async/await downleveled like Metro's Babel preset does in apps,
+    // so SDK async code runs on the global (polyfilled) Promise that `Sentry.init` installs.
+    "target": "es2016"
+  }
+}

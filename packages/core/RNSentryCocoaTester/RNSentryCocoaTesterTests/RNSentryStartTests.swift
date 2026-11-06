@@ -1,0 +1,354 @@
+@_spi(Private) import Sentry
+import XCTest
+
+final class RNSentryStartTests: XCTestCase {
+
+    func testStartDoesNotThrowWithoutConfigure() {
+        RNSentrySDK.start(configureOptions: nil)
+    }
+
+    func assertReactDefaults(_ actualOptions: Options?) {
+        XCTAssertFalse(actualOptions!.enableCaptureFailedRequests)
+        XCTAssertNil(actualOptions!.tracesSampleRate)
+        XCTAssertNil(actualOptions!.tracesSampler)
+    }
+
+    func testStartSetsReactDeafults() {
+        var actualOptions: Options?
+
+        RNSentrySDK.start { options in
+            actualOptions = options
+        }
+
+        XCTAssertNotNil(actualOptions, "start have not provided default options or have not executed configure callback")
+        assertReactDefaults(actualOptions)
+    }
+
+    func testAutoStartSetsReactDefaults() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456"
+        ])
+
+        let actualOptions = SentrySDK.internal.options
+        assertReactDefaults(actualOptions)
+    }
+
+    func testStartEnablesHybridTracing() throws {
+        let testCases: [() throws -> Void] = [
+            {
+                RNSentrySDK.start { options in
+                    options.dsn = "https://abcd@efgh.ingest.sentry.io/123456"
+                }
+            },
+            {
+                try self.startFromRN(options: [
+                    "dsn": "https://abcd@efgh.ingest.sentry.io/123456"
+                ])
+            },
+            {
+                RNSentrySDK.start { options in
+                    options.dsn = "https://abcd@efgh.ingest.sentry.io/123456"
+                    options.enableAutoPerformanceTracing = true
+                }
+            },
+            {
+                try self.startFromRN(options: [
+                    "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+                    "enableAutoPerformanceTracing": true
+                ])
+            }
+        ]
+
+        // Test each implementation
+        for startMethod in testCases {
+            try startMethod()
+
+            let actualOptions = SentrySDK.internal.options
+
+            XCTAssertTrue(SentrySDK.internal.appStart.hybridSDKMode)
+            XCTAssertTrue(SentrySDK.internal.performance.framesTrackingHybridSDKMode)
+        }
+    }
+
+    func testStartDisablesHybridTracing() throws {
+        let testCases: [() throws -> Void] = [
+            {
+                RNSentrySDK.start { options in
+                    options.dsn = "https://abcd@efgh.ingest.sentry.io/123456"
+                    options.enableAutoPerformanceTracing = false
+                }
+            },
+            {
+                try self.startFromRN(options: [
+                    "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+                    "enableAutoPerformanceTracing": false
+                ])
+            }
+        ]
+
+        for startMethod in testCases {
+            try startMethod()
+
+            let actualOptions = SentrySDK.internal.options
+
+            XCTAssertFalse(SentrySDK.internal.appStart.hybridSDKMode)
+            XCTAssertFalse(SentrySDK.internal.performance.framesTrackingHybridSDKMode)
+        }
+    }
+
+    func testStartIgnoresUnhandledJsExceptions() throws {
+        let testCases: [() throws -> Void] = [
+            {
+                RNSentrySDK.start { options in
+                    options.dsn = "https://abcd@efgh.ingest.sentry.io/123456"
+                }
+            },
+            {
+                try self.startFromRN(options: [
+                    "dsn": "https://abcd@efgh.ingest.sentry.io/123456"
+                ])
+            }
+        ]
+
+        for startMethod in testCases {
+            try startMethod()
+
+            let actualOptions = SentrySDK.internal.options
+
+            let actualEvent = actualOptions.beforeSend!(createUnhandledJsExceptionEvent())
+
+            XCTAssertNil(actualEvent)
+        }
+    }
+
+    func testStartSetsNativeEventOrigin() throws {
+        let testCases: [() throws -> Void] = [
+            {
+                RNSentrySDK.start { options in
+                    options.dsn = "https://abcd@efgh.ingest.sentry.io/123456"
+                }
+            },
+            {
+                try self.startFromRN(options: [
+                    "dsn": "https://abcd@efgh.ingest.sentry.io/123456"
+                ])
+            }
+        ]
+
+        for startMethod in testCases {
+            try startMethod()
+
+            let actualOptions = SentrySDK.internal.options
+
+            let actualEvent = actualOptions.beforeSend!(createNativeEvent())
+
+            XCTAssertNotNil(actualEvent)
+            XCTAssertNotNil(actualEvent!.tags)
+            XCTAssertEqual(actualEvent!.tags!["event.origin"], "ios")
+            XCTAssertEqual(actualEvent!.tags!["event.environment"], "native")
+        }
+    }
+
+    func testStartDoesNotOverwriteUserBeforeSend() {
+        var executed = false
+
+        RNSentrySDK.start { options in
+            options.dsn = "https://abcd@efgh.ingest.sentry.io/123456"
+            options.beforeSend = { event in
+                executed = true
+                return event
+            }
+        }
+
+        SentrySDK.internal.options.beforeSend!(genericEvent())
+
+        XCTAssertTrue(executed)
+    }
+
+    func testStartSetsHybridSdkName() throws {
+        let testCases: [() throws -> Void] = [
+            {
+                RNSentrySDK.start { options in
+                    options.dsn = "https://abcd@efgh.ingest.sentry.io/123456"
+                }
+            },
+            {
+                try self.startFromRN(options: [
+                    "dsn": "https://abcd@efgh.ingest.sentry.io/123456"
+                ])
+            }
+        ]
+
+        for startMethod in testCases {
+            try startMethod()
+
+            let actualEvent = captuteTestEvent()
+
+            XCTAssertNotNil(actualEvent)
+            XCTAssertNotNil(actualEvent!.sdk)
+            XCTAssertEqual(actualEvent!.sdk!["name"] as! String, NATIVE_SDK_NAME)
+
+            let packages = actualEvent!.sdk!["packages"] as! [[String: String]]
+            let reactPackage = packages.first { $0["name"] == REACT_NATIVE_SDK_PACKAGE_NAME }
+
+            XCTAssertNotNil(reactPackage)
+            XCTAssertEqual(reactPackage!["name"], REACT_NATIVE_SDK_PACKAGE_NAME)
+            XCTAssertEqual(reactPackage!["version"], REACT_NATIVE_SDK_PACKAGE_VERSION)
+        }
+    }
+
+    func testScreenshotMaskingOptions() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+            "attachScreenshot": true,
+            "screenshot": [
+                "maskAllText": false,
+                "maskAllImages": true
+            ]
+        ])
+
+        let actualOptions = SentrySDK.internal.options
+        XCTAssertTrue(actualOptions.attachScreenshot)
+        XCTAssertFalse(actualOptions.screenshot.maskAllText)
+        XCTAssertTrue(actualOptions.screenshot.maskAllImages)
+    }
+
+    func testScreenshotMaskingOptionsDefaults() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+            "attachScreenshot": true
+        ])
+
+        let actualOptions = SentrySDK.internal.options
+        XCTAssertTrue(actualOptions.attachScreenshot)
+        XCTAssertTrue(actualOptions.screenshot.maskAllText)
+        XCTAssertTrue(actualOptions.screenshot.maskAllImages)
+    }
+
+    func testScreenshotMasksSentryMaskComponent() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+            "attachScreenshot": true,
+            "screenshot": [
+                "maskAllText": false,
+                "maskAllImages": false
+            ]
+        ])
+
+        let maskedViewClasses = SentrySDK.internal.options.screenshot.maskedViewClasses
+        XCTAssertTrue(maskedViewClasses.contains { $0 == RNSentryReplay.getMaskClass() })
+    }
+
+    func testScreenshotMasksSentryMaskComponentWithoutScreenshotOptions() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+            "attachScreenshot": true
+        ])
+
+        let maskedViewClasses = SentrySDK.internal.options.screenshot.maskedViewClasses
+        XCTAssertTrue(maskedViewClasses.contains { $0 == RNSentryReplay.getMaskClass() })
+    }
+
+    func testScreenshotKeepsUserMaskedViewClassesWithSentryMaskComponent() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+            "attachScreenshot": true,
+            "screenshot": [
+                "maskedViewClasses": ["UILabel"]
+            ]
+        ])
+
+        let maskedViewClasses = SentrySDK.internal.options.screenshot.maskedViewClasses
+        XCTAssertTrue(maskedViewClasses.contains { $0 == UILabel.self })
+        XCTAssertTrue(maskedViewClasses.contains { $0 == RNSentryReplay.getMaskClass() })
+    }
+
+    func testMemoryIntrospectionOption() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+            "enableMemoryIntrospection": true
+        ])
+
+        let actualOptions = SentrySDK.internal.options
+        XCTAssertTrue(actualOptions.enableMemoryIntrospection)
+    }
+
+    func testMemoryIntrospectionOptionDefault() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456"
+        ])
+
+        let actualOptions = SentrySDK.internal.options
+        XCTAssertFalse(actualOptions.enableMemoryIntrospection)
+    }
+
+    func testShutdownTimeoutMapsMillisecondsToSeconds() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456",
+            // JS passes milliseconds; Cocoa's shutdownTimeInterval is in seconds
+            "shutdownTimeout": 5_000
+        ])
+
+        let actualOptions = SentrySDK.internal.options
+        XCTAssertEqual(actualOptions.shutdownTimeInterval, 5.0)
+    }
+
+    func testShutdownTimeoutDefault() throws {
+        try startFromRN(options: [
+            "dsn": "https://abcd@efgh.ingest.sentry.io/123456"
+        ])
+
+        let actualOptions = SentrySDK.internal.options
+        // Cocoa's default shutdownTimeInterval is 2 seconds
+        XCTAssertEqual(actualOptions.shutdownTimeInterval, 2.0)
+    }
+
+    func startFromRN(options: [String: Any]) throws {
+        var error: NSError?
+        RNSentryStart.start(options: options, error: &error)
+
+        if let error = error {
+            throw error
+        }
+    }
+
+    func createUnhandledJsExceptionEvent() -> Event {
+        let event = Event()
+        event.exceptions = []
+        event.exceptions!.append(Exception(value: "Test", type: "Unhandled JS Exception: undefined is not a function"))
+        return event
+    }
+
+    func createNativeEvent() -> Event {
+        let event = Event()
+        event.sdk = [
+            "name": NATIVE_SDK_NAME,
+            "version": "1.2.3"
+        ]
+        return event
+    }
+
+    func genericEvent() -> Event {
+        return Event()
+    }
+
+    func captuteTestEvent() -> Event? {
+        var actualEvent: Event?
+
+        // This is the closest to the sent event we can get using the actual Sentry start method
+        let originalBeforeSend = SentrySDK.internal.options.beforeSend
+        SentrySDK.internal.options.beforeSend = { event in
+            if let originalBeforeSend = originalBeforeSend {
+                let processedEvent = originalBeforeSend(event)
+                actualEvent = processedEvent
+                return processedEvent
+            }
+            actualEvent = event
+            return event
+        }
+
+        SentrySDK.capture(message: "Test")
+
+        return actualEvent
+    }
+}

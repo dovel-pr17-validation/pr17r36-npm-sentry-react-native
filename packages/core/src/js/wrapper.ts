@@ -1,0 +1,1269 @@
+/* oxlint-disable eslint(max-lines) */
+import type {
+  BaseEnvelopeItemHeaders,
+  Breadcrumb,
+  Envelope,
+  EnvelopeItem,
+  Event,
+  Package,
+  Primitive,
+  SeverityLevel,
+  User,
+} from '@sentry/core';
+
+import { debug, normalize, SentryError } from '@sentry/core';
+import { NativeModules, Platform } from 'react-native';
+
+import type {
+  NativeAppStartResponse,
+  NativeDeviceContextsResponse,
+  NativeFramesResponse,
+  NativeReleaseResponse,
+  NativeScreenshot,
+  NativeStackFrames,
+  Spec,
+} from './NativeRNSentry';
+import type { ProfilingOptions, ReactNativeClientOptions } from './options';
+import type * as Hermes from './profiling/hermes';
+import type { NativeAndroidProfileEvent, NativeProfileEvent } from './profiling/nativeTypes';
+import type { MobileReplayOptions } from './replay/mobilereplay';
+import type { RequiredKeysUser } from './user';
+
+import { isHardCrash } from './misc';
+import { encodeToBase64 } from './utils/base64';
+import { encodeUTF8 } from './utils/encode';
+import { isTurboModuleEnabled } from './utils/environment';
+import { convertToNormalizedObject } from './utils/normalize';
+import { ReactNativeLibraries } from './utils/rnlibraries';
+import { SDK_VERSION } from './version';
+
+/**
+ * Returns the RNSentry module. Dynamically resolves if NativeModule or TurboModule is used.
+ */
+export function getRNSentryModule(): Spec | undefined {
+  return isTurboModuleEnabled()
+    ? (ReactNativeLibraries.TurboModuleRegistry?.get<Spec>('RNSentry') ?? undefined)
+    : NativeModules.RNSentry;
+}
+
+let RNSentry: Spec | undefined = getRNSentryModule();
+
+export interface Screenshot {
+  data: Uint8Array;
+  contentType: string;
+  filename: string;
+}
+
+export type NativeSdkOptions = Partial<ReactNativeClientOptions> & {
+  devServerUrl: string | undefined;
+  defaultSidecarUrl: string | undefined;
+  ignoreErrorsStr?: string[] | undefined;
+  ignoreErrorsRegex?: string[] | undefined;
+} & {
+  mobileReplayOptions: MobileReplayOptions | undefined;
+  sdkVersion?: string | undefined;
+  profilingOptions?: ProfilingOptions | undefined;
+  /** @deprecated Use `profilingOptions` instead. */
+  androidProfilingOptions?: ProfilingOptions | undefined;
+};
+
+interface SentryNativeWrapper {
+  enableNative: boolean;
+  nativeIsReady: boolean;
+  platform: typeof Platform.OS;
+
+  _NativeClientError: Error;
+  _DisabledNativeError: Error;
+  _platformProfilers: boolean;
+
+  _setPrimitiveProcessor: (processor: (value: Primitive) => void) => void;
+  _processItem(envelopeItem: EnvelopeItem): EnvelopeItem;
+  _processLevels(event: Event): Event;
+  _processLevel(level: SeverityLevel): SeverityLevel;
+  _serializeObject(data: { [key: string]: unknown }): { [key: string]: string };
+  _isModuleLoaded(module: Spec | undefined): module is Spec;
+  _callReplayControl(
+    method: 'startReplay' | 'startReplayBuffering' | 'stopReplay' | 'pauseReplay' | 'resumeReplay' | 'flushReplay',
+  ): Promise<void>;
+
+  isNativeAvailable(): boolean;
+
+  initNativeSdk(options: NativeSdkOptions): PromiseLike<boolean>;
+  closeNativeSdk(): PromiseLike<void>;
+
+  sendEnvelope(envelope: Envelope): Promise<void>;
+  captureScreenshot(): Promise<Screenshot[] | null>;
+
+  fetchNativeRelease(): PromiseLike<NativeReleaseResponse>;
+  fetchNativeDeviceContexts(): PromiseLike<NativeDeviceContextsResponse | null>;
+  fetchNativeLogAttributes(): Promise<NativeDeviceContextsResponse | null>;
+  fetchNativeAppStart(): PromiseLike<NativeAppStartResponse | null>;
+  fetchNativeFrames(): PromiseLike<NativeFramesResponse | null>;
+  fetchNativeFramesDelay(startTimestampSeconds: number, endTimestampSeconds: number): PromiseLike<number | null>;
+  fetchNativeSdkInfo(): PromiseLike<Package | null>;
+
+  disableNativeFramesTracking(): void;
+  enableNativeFramesTracking(): void;
+  pauseAppHangTracking(): void;
+  resumeAppHangTracking(): void;
+  startJsHangTracking(timeoutIntervalMs: number, bundleDebugId: string | null): void;
+  stopJsHangTracking(): void;
+
+  addBreadcrumb(breadcrumb: Breadcrumb): void;
+  // oxlint-disable-next-line typescript-eslint(no-explicit-any)
+  setContext(key: string, context: { [key: string]: any } | null): void;
+  clearBreadcrumbs(): void;
+  setExtra(key: string, extra: unknown): void;
+  setUser(user: User | null): void;
+  setTag(key: string, value?: string): void;
+  addFeatureFlag(name: string, value: boolean): void;
+  setAttribute(key: string, value: string | number | boolean): void;
+  setAttributes(attributes: Record<string, string | number | boolean>): void;
+  removeAttribute(key: string): void;
+
+  nativeCrash(): void;
+
+  fetchModules(): Promise<Record<string, string> | null>;
+  fetchViewHierarchy(): PromiseLike<Uint8Array | null>;
+
+  startProfiling(platformProfilers: boolean): boolean;
+  stopProfiling(): {
+    hermesProfile: Hermes.Profile;
+    nativeProfile?: NativeProfileEvent;
+    androidProfile?: NativeAndroidProfileEvent;
+  } | null;
+
+  /**
+   * Starts the native UI profiler and resolves its profiler id,
+   * or `null` when the profiler does not run or the platform does not report the id.
+   */
+  startProfiler(): Promise<string | null>;
+  stopProfiler(): Promise<void>;
+  /**
+   * Returns the native id of the calling thread, which is the JS thread, in the format of the native profiler.
+   */
+  getCurrentThreadId(): string | null;
+
+  fetchNativePackageName(): string | null;
+
+  /**
+   * Fetches native stack frames and debug images for the instructions addresses.
+   */
+  fetchNativeStackFramesBy(instructionsAddr: number[]): NativeStackFrames | null;
+  initNativeReactNavigationNewFrameTracking(): Promise<void>;
+
+  captureReplay(isHardCrash: boolean): Promise<string | null>;
+  getCurrentReplayId(): string | null;
+  startReplay(): Promise<void>;
+  startReplayBuffering(): Promise<void>;
+  stopReplay(): Promise<void>;
+  pauseReplay(): Promise<void>;
+  resumeReplay(): Promise<void>;
+  flushReplay(): Promise<void>;
+  registerReplayTraceId(traceId: string): void;
+
+  crashedLastRun(): Promise<boolean | null>;
+  getNewScreenTimeToDisplay(): Promise<number | null | undefined>;
+
+  getDataFromUri(uri: string): Promise<Uint8Array | null>;
+  popTimeToDisplayFor(key: string): Promise<number | undefined | null>;
+
+  setActiveSpanId(spanId: string): void;
+
+  setCurrentScopePropagationContext(ctx: {
+    traceId: string;
+    spanId: string;
+    sampled: boolean;
+    sampleRand: number;
+  }): boolean;
+
+  encodeToBase64(data: Uint8Array): Promise<string | null>;
+
+  primitiveProcessor(value: Primitive): string;
+}
+
+const EOL = encodeUTF8('\n');
+
+/**
+ * A JS function crosses the bridge as a native callback that only accepts an array.
+ * The native SDK calls hooks such as `beforeSend` or `beforeSendLog` with a native
+ * object instead, which crashes the app.
+ */
+function withoutFunctionValues<T extends object>(options: T): T {
+  const source = options as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(source)) {
+    if (typeof source[key] !== 'function') {
+      result[key] = source[key];
+    }
+  }
+  return result as T;
+}
+
+/**
+ * Our internal interface for calling native functions
+ */
+export const NATIVE: SentryNativeWrapper = {
+  async fetchModules(): Promise<Record<string, string> | null> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    const raw = await RNSentry.fetchModules();
+    if (raw) {
+      return JSON.parse(raw);
+    }
+    return null;
+  },
+  /**
+   * Sending the envelope over the bridge to native
+   * @param envelope Envelope
+   */
+  async sendEnvelope(envelope: Envelope): Promise<void> {
+    if (!this.enableNative) {
+      debug.warn('Event was skipped as native SDK is not enabled.');
+      return;
+    }
+
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    const [envelopeHeader, envelopeItems] = envelope;
+
+    const headerString = JSON.stringify(envelopeHeader);
+    const headerBytes = encodeUTF8(headerString);
+    let envelopeBytes: Uint8Array = new Uint8Array(headerBytes.length + EOL.length);
+    envelopeBytes.set(headerBytes);
+    envelopeBytes.set(EOL, headerBytes.length);
+
+    let hardCrashed: boolean = false;
+    for (const rawItem of envelopeItems) {
+      const [itemHeader, itemPayload] = this._processItem(rawItem);
+
+      let bytesContentType: string;
+      let bytesPayload: number[] | Uint8Array | undefined;
+
+      if (typeof itemPayload === 'string') {
+        bytesContentType = 'text/plain';
+        bytesPayload = encodeUTF8(itemPayload);
+      } else if (itemPayload instanceof Uint8Array) {
+        bytesContentType =
+          typeof itemHeader.content_type === 'string' ? itemHeader.content_type : 'application/octet-stream';
+        bytesPayload = itemPayload;
+      } else {
+        bytesContentType = typeof itemHeader.content_type === 'string' ? itemHeader.content_type : 'application/json';
+        bytesPayload = encodeUTF8(JSON.stringify(itemPayload));
+        if (!hardCrashed) {
+          hardCrashed = isHardCrash(itemPayload);
+        }
+      }
+
+      // Content type is not inside BaseEnvelopeItemHeaders.
+      (itemHeader as BaseEnvelopeItemHeaders).content_type = bytesContentType;
+      (itemHeader as BaseEnvelopeItemHeaders).length = bytesPayload.length;
+      const serializedItemHeader = JSON.stringify(itemHeader);
+
+      const bytesItemHeader = encodeUTF8(serializedItemHeader);
+      const newBytes = new Uint8Array(
+        envelopeBytes.length + bytesItemHeader.length + EOL.length + bytesPayload.length + EOL.length,
+      );
+      newBytes.set(envelopeBytes);
+      newBytes.set(bytesItemHeader, envelopeBytes.length);
+      newBytes.set(EOL, envelopeBytes.length + bytesItemHeader.length);
+      newBytes.set(bytesPayload, envelopeBytes.length + bytesItemHeader.length + EOL.length);
+      newBytes.set(EOL, envelopeBytes.length + bytesItemHeader.length + EOL.length + bytesPayload.length);
+      envelopeBytes = newBytes;
+    }
+
+    await RNSentry.captureEnvelope(encodeToBase64(envelopeBytes), { hardCrashed });
+  },
+
+  /**
+   * Starts native with the provided options.
+   * @param options ReactNativeClientOptions
+   */
+  async initNativeSdk(originalOptions: NativeSdkOptions): Promise<boolean> {
+    const options: NativeSdkOptions = {
+      enableNative: true,
+      autoInitializeNativeSdk: true,
+      ...originalOptions,
+      // Keeps original behavior of enableLogs by not setting it when not defined.
+      ...(originalOptions.enableLogs !== undefined
+        ? { enableLogs: originalOptions.enableLogs && originalOptions.logsOrigin !== 'js' }
+        : {}),
+    };
+
+    if (!options.enableNative) {
+      if (options.enableNativeNagger) {
+        debug.warn('Note: Native Sentry SDK is disabled.');
+      }
+      this.enableNative = false;
+      return false;
+    }
+    if (!options.autoInitializeNativeSdk) {
+      if (options.enableNativeNagger) {
+        debug.warn(
+          'Note: Native Sentry SDK was not initialized automatically, you will need to initialize it manually. If you wish to disable the native SDK and get rid of this warning, pass enableNative: false',
+        );
+      }
+      this.enableNative = true;
+      return false;
+    }
+
+    if (options.dsn && options.dsn !== options.dsn.trim()) {
+      debug.warn('The DSN contains whitespace which can cause native crashes. Whitespace has been trimmed.');
+      options.dsn = options.dsn.trim();
+    }
+
+    if (!options.dsn) {
+      debug.warn(
+        'Warning: No DSN was provided. The Sentry SDK will be disabled. Native SDK will also not be initalized.',
+      );
+      this.enableNative = false;
+      return false;
+    }
+
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+    const ignoreErrorsStr = options.ignoreErrors?.filter((item): item is string => typeof item === 'string');
+    const ignoreErrorsRegex = options.ignoreErrors
+      ?.filter((item): item is RegExp => item instanceof RegExp)
+      .map(item => item.source);
+
+    if (ignoreErrorsStr && ignoreErrorsStr.length > 0) {
+      options.ignoreErrorsStr = ignoreErrorsStr;
+    }
+    if (ignoreErrorsRegex && ignoreErrorsRegex.length > 0) {
+      options.ignoreErrorsRegex = ignoreErrorsRegex;
+    }
+
+    // filter out all the options that would crash native.
+    /* oxlint-disable typescript-eslint(no-unused-vars) */
+    const {
+      integrations,
+      ignoreErrors,
+      logsOrigin,
+      profilingOptions,
+      androidProfilingOptions,
+      enableJsHangTracking,
+      jsHangTimeoutInterval,
+      ...remainingOptions
+    } = options;
+    /* oxlint-enable typescript-eslint(no-unused-vars) */
+
+    const filteredOptions = withoutFunctionValues(remainingOptions);
+
+    // Move profilingOptions into _experiments
+    // Support deprecated androidProfilingOptions for backwards compatibility
+    const resolvedProfilingOptions = profilingOptions ?? androidProfilingOptions;
+    if (resolvedProfilingOptions) {
+      filteredOptions._experiments = {
+        ...filteredOptions._experiments,
+        profilingOptions: resolvedProfilingOptions,
+      };
+    }
+
+    filteredOptions.sdkVersion = SDK_VERSION;
+
+    const nativeIsReady = await RNSentry.initNativeSdk(filteredOptions);
+
+    this.nativeIsReady = nativeIsReady;
+    this.enableNative = true;
+
+    return nativeIsReady;
+  },
+
+  /**
+   * Fetches the attributes to be set into logs from Native
+   */
+  async fetchNativeLogAttributes(): Promise<NativeDeviceContextsResponse | null> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    return RNSentry.fetchNativeLogAttributes();
+  },
+  /**
+   * Fetches the release from native
+   */
+  async fetchNativeRelease(): Promise<NativeReleaseResponse> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    return RNSentry.fetchNativeRelease();
+  },
+
+  /**
+   * Fetches the Sdk info for the native sdk.
+   */
+  async fetchNativeSdkInfo(): Promise<Package | null> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    return RNSentry.fetchNativeSdkInfo();
+  },
+
+  /**
+   * Fetches the device contexts. Not used on Android.
+   */
+  async fetchNativeDeviceContexts(): Promise<NativeDeviceContextsResponse | null> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    return RNSentry.fetchNativeDeviceContexts();
+  },
+
+  async fetchNativeAppStart(): Promise<NativeAppStartResponse | null> {
+    if (!this.enableNative) {
+      debug.warn(this._DisabledNativeError);
+      return null;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      debug.error(this._NativeClientError);
+      return null;
+    }
+
+    return RNSentry.fetchNativeAppStart();
+  },
+
+  async fetchNativeFrames(): Promise<NativeFramesResponse | null> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    return RNSentry.fetchNativeFrames();
+  },
+
+  async fetchNativeFramesDelay(startTimestampSeconds: number, endTimestampSeconds: number): Promise<number | null> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    return RNSentry.fetchNativeFramesDelay(startTimestampSeconds, endTimestampSeconds);
+  },
+
+  /**
+   * Triggers a native crash.
+   * Use this only for testing purposes.
+   */
+  nativeCrash(): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    RNSentry.crash();
+  },
+
+  /**
+   * Sets the user in the native scope.
+   * Passing null clears the user.
+   */
+  setUser(user: User | null): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    // separate and serialize all non-default user keys.
+    let userKeys: { [key: string]: unknown } | null = null;
+    let userDataKeys: { [key: string]: string } | null = null;
+    if (user) {
+      const { id, ip_address, email, username, geo, ...otherKeys } = user;
+      const requiredUser: RequiredKeysUser = {
+        id,
+        ip_address,
+        email,
+        username,
+        geo,
+      };
+      userKeys = this._serializeObject(requiredUser);
+      // `geo` is a structured object that the native SDKs deserialize from a
+      // nested map. `_serializeObject` JSON-stringifies it like the scalar keys,
+      // which breaks native deserialization and drops the entire user, so
+      // overwrite it with the object. See
+      // https://github.com/getsentry/sentry-react-native/issues/6306
+      if (geo !== undefined) {
+        userKeys.geo = geo;
+      }
+      userDataKeys = this._serializeObject(otherKeys);
+    }
+
+    RNSentry.setUser(userKeys, userDataKeys);
+  },
+
+  /**
+   * Sets a tag in the native module.
+   * @param key string
+   * @param value string
+   */
+  setTag(key: string, value?: string): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    // `JSON.stringify(undefined)` returns `undefined` (same for functions/symbols). Forwarding
+    // that to the non-nullable native `value` parameter crosses the New Architecture bridge as
+    // `null` and triggers an RCTConvert warning (`JSON value '<null>' ... cannot be converted to
+    // NSString`). Always send a string, mirroring `setExtra`. See #6645.
+    const stringifiedValue = typeof value === 'string' ? value : (JSON.stringify(value) ?? 'undefined');
+
+    RNSentry.setTag(key, stringifiedValue);
+  },
+
+  /**
+   * Forwards a feature flag evaluation to the native scope so it is attached to
+   * native crashes and native error events.
+   * @param name string
+   * @param value boolean
+   */
+  addFeatureFlag(name: string, value: boolean): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    RNSentry.addFeatureFlag(name, value);
+  },
+
+  /**
+   * Sets an extra in the native scope, will stringify
+   * extra value if it isn't already a string.
+   * @param key string
+   * @param extra any
+   */
+  setExtra(key: string, extra: unknown): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    if (typeof extra === 'string') {
+      return RNSentry.setExtra(key, extra);
+    }
+    if (typeof extra === 'undefined') {
+      return RNSentry.setExtra(key, 'undefined');
+    }
+
+    let stringifiedExtra: string | undefined;
+    try {
+      const normalizedExtra = normalize(extra);
+      stringifiedExtra = JSON.stringify(normalizedExtra);
+    } catch (e) {
+      debug.error('Extra for key ${key} not passed to native SDK, because it contains non-stringifiable values', e);
+    }
+
+    if (typeof stringifiedExtra === 'string') {
+      return RNSentry.setExtra(key, stringifiedExtra);
+    }
+    return RNSentry.setExtra(key, '**non-stringifiable**');
+  },
+
+  /**
+   * Adds breadcrumb to the native scope.
+   * @param breadcrumb Breadcrumb
+   */
+  addBreadcrumb(breadcrumb: Breadcrumb): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    RNSentry.addBreadcrumb({
+      ...breadcrumb,
+      // Process and convert deprecated levels
+      level: breadcrumb.level ? this._processLevel(breadcrumb.level) : undefined,
+    });
+  },
+
+  /**
+   * Clears breadcrumbs on the native scope.
+   */
+  clearBreadcrumbs(): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    RNSentry.clearBreadcrumbs();
+  },
+
+  /**
+   * Sets context on the native scope.
+   * @param key string
+   * @param context key-value map
+   */
+  // oxlint-disable-next-line typescript-eslint(no-explicit-any)
+  setContext(key: string, context: { [key: string]: any } | null): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    // Clearing a context must go through the dedicated `removeContext` native method rather than
+    // `setContext(key, null)`. On the New Architecture, forwarding `null` for the `NSDictionary`
+    // parameter crosses the bridge as `NSNull` and RN's interop layer logs an RCTConvert warning
+    // (`JSON value '<null>' of type NSNull cannot be converted to NSDictionary`) *before* our native
+    // method runs — even though the parameter is nullable. See #6645.
+    if (context === null) {
+      // `removeContext` is a newer native method. Guard against a stale native binary (JS updated
+      // without a native rebuild) where it would be `undefined`, and fall back to the legacy
+      // `setContext(key, null)` path so clearing a context never throws.
+      return typeof RNSentry.removeContext === 'function'
+        ? RNSentry.removeContext(key)
+        : RNSentry.setContext(key, null);
+    }
+
+    let normalizedContext: Record<string, unknown> | undefined;
+    try {
+      normalizedContext = convertToNormalizedObject(context);
+    } catch (e) {
+      debug.error('Context for key ${key} not passed to native SDK, because it contains non-serializable values', e);
+    }
+
+    if (normalizedContext) {
+      RNSentry.setContext(key, normalizedContext);
+    } else {
+      RNSentry.setContext(key, { error: '**non-serializable**' });
+    }
+  },
+
+  /**
+   * Sets an attribute on the native scope.
+   * @param key string
+   * @param value primitive value (string, number, or boolean)
+   */
+  setAttribute(key: string, value: string | number | boolean): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    const stringifiedValue = this.primitiveProcessor(value);
+    RNSentry.setAttribute(key, stringifiedValue);
+  },
+
+  /**
+   * Sets multiple attributes on the native scope.
+   * @param attributes key-value map of attributes (only string, number, and boolean values)
+   */
+  setAttributes(attributes: Record<string, string | number | boolean>): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    const serializedAttributes: Record<string, string> = {};
+    Object.keys(attributes).forEach(key => {
+      serializedAttributes[key] = this.primitiveProcessor(attributes[key]);
+    });
+
+    RNSentry.setAttributes(serializedAttributes);
+  },
+
+  /**
+   * Removes an attribute from the native scope.
+   * @param key string
+   */
+  removeAttribute(key: string): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    RNSentry.removeAttribute(key);
+  },
+
+  /**
+   * Closes the Native Layer SDK
+   */
+  async closeNativeSdk(): Promise<void> {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return;
+    }
+
+    return RNSentry.closeNativeSdk().then(() => {
+      this.enableNative = false;
+    });
+  },
+
+  disableNativeFramesTracking(): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return;
+    }
+
+    RNSentry.disableNativeFramesTracking();
+  },
+
+  enableNativeFramesTracking(): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return;
+    }
+
+    RNSentry.enableNativeFramesTracking();
+  },
+
+  pauseAppHangTracking(): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return;
+    }
+
+    RNSentry.pauseAppHangTracking();
+  },
+
+  resumeAppHangTracking(): void {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return;
+    }
+
+    RNSentry.resumeAppHangTracking();
+  },
+
+  startJsHangTracking(timeoutIntervalMs: number, bundleDebugId: string | null): void {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry) || typeof RNSentry.startJsHangTracking !== 'function') {
+      return;
+    }
+
+    try {
+      RNSentry.startJsHangTracking(timeoutIntervalMs, bundleDebugId);
+    } catch (error) {
+      debug.error('[NATIVE] Start JS Hang Tracking Failed', error);
+    }
+  },
+
+  stopJsHangTracking(): void {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry) || typeof RNSentry.stopJsHangTracking !== 'function') {
+      return;
+    }
+
+    try {
+      RNSentry.stopJsHangTracking();
+    } catch (error) {
+      debug.error('[NATIVE] Stop JS Hang Tracking Failed', error);
+    }
+  },
+
+  isNativeAvailable(): boolean {
+    if (!RNSentry) {
+      RNSentry = getRNSentryModule();
+    }
+    return this._isModuleLoaded(RNSentry);
+  },
+
+  async captureScreenshot(): Promise<Screenshot[] | null> {
+    if (!this.enableNative) {
+      debug.warn(this._DisabledNativeError);
+      return null;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      debug.error(this._NativeClientError);
+      return null;
+    }
+
+    let raw: NativeScreenshot[] | null | undefined;
+    try {
+      raw = await RNSentry.captureScreenshot();
+    } catch (e) {
+      debug.warn('Failed to capture screenshot', e);
+    }
+
+    if (raw) {
+      return raw.map((item: NativeScreenshot) => ({
+        ...item,
+        data: new Uint8Array(item.data),
+      }));
+    } else {
+      return null;
+    }
+  },
+
+  async fetchViewHierarchy(): Promise<Uint8Array | null> {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    const raw = await RNSentry.fetchViewHierarchy();
+    return raw ? new Uint8Array(raw) : null;
+  },
+
+  startProfiling(platformProfilers: boolean): boolean {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    this._platformProfilers = platformProfilers;
+    const { started, error } = RNSentry.startProfiling(platformProfilers);
+    if (started) {
+      debug.log('[NATIVE] Start Profiling');
+    } else {
+      debug.error('[NATIVE] Start Profiling Failed', error);
+    }
+
+    return !!started;
+  },
+
+  async startProfiler(): Promise<string | null> {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry) || typeof RNSentry.startProfiler !== 'function') {
+      return null;
+    }
+
+    try {
+      return (await RNSentry.startProfiler()) ?? null;
+    } catch (error) {
+      debug.error('[NATIVE] Start Profiler Failed', error);
+      return null;
+    }
+  },
+
+  async stopProfiler(): Promise<void> {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry) || typeof RNSentry.stopProfiler !== 'function') {
+      return;
+    }
+
+    try {
+      await RNSentry.stopProfiler();
+    } catch (error) {
+      debug.error('[NATIVE] Stop Profiler Failed', error);
+    }
+  },
+
+  getCurrentThreadId(): string | null {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry) || typeof RNSentry.getCurrentThreadId !== 'function') {
+      return null;
+    }
+
+    try {
+      return RNSentry.getCurrentThreadId() ?? null;
+    } catch (error) {
+      debug.error('[NATIVE] Get Current Thread Id Failed', error);
+      return null;
+    }
+  },
+
+  stopProfiling(): {
+    hermesProfile: Hermes.Profile;
+    nativeProfile?: NativeProfileEvent;
+    androidProfile?: NativeAndroidProfileEvent;
+  } | null {
+    if (!this.enableNative) {
+      throw this._DisabledNativeError;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      throw this._NativeClientError;
+    }
+
+    const { profile, nativeProfile, androidProfile, error } = RNSentry.stopProfiling();
+    if (!profile || error) {
+      debug.error('[NATIVE] Stop Profiling Failed', error);
+      return null;
+    }
+    if (this._platformProfilers && Platform.OS === 'ios' && !nativeProfile) {
+      debug.warn('[NATIVE] Stop Profiling Failed: No Native Profile');
+    }
+    if (this._platformProfilers && Platform.OS === 'android' && !androidProfile) {
+      debug.warn('[NATIVE] Stop Profiling Failed: No Android Profile');
+    }
+
+    try {
+      return {
+        hermesProfile: JSON.parse(profile) as Hermes.Profile,
+        nativeProfile: nativeProfile as NativeProfileEvent | undefined,
+        androidProfile: androidProfile as NativeAndroidProfileEvent | undefined,
+      };
+    } catch (e) {
+      debug.error('[NATIVE] Failed to parse Hermes Profile JSON', e);
+      return null;
+    }
+  },
+
+  fetchNativePackageName(): string | null {
+    if (!this.enableNative) {
+      return null;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return null;
+    }
+
+    return RNSentry.fetchNativePackageName() || null;
+  },
+
+  fetchNativeStackFramesBy(instructionsAddr: number[]): NativeStackFrames | null {
+    if (!this.enableNative) {
+      return null;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return null;
+    }
+
+    return RNSentry.fetchNativeStackFramesBy(instructionsAddr) || null;
+  },
+
+  async initNativeReactNavigationNewFrameTracking(): Promise<void> {
+    if (!this.enableNative) {
+      return;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return;
+    }
+
+    return RNSentry.initNativeReactNavigationNewFrameTracking();
+  },
+
+  async captureReplay(isHardCrash: boolean): Promise<string | null> {
+    if (!this.enableNative) {
+      debug.warn(`[NATIVE] \`${this.captureReplay.name}\` is not available when native is disabled.`);
+      return Promise.resolve(null);
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      debug.warn(`[NATIVE] \`${this.captureReplay.name}\` is not available when native is not available.`);
+      return Promise.resolve(null);
+    }
+
+    return (await RNSentry.captureReplay(isHardCrash)) || null;
+  },
+
+  getCurrentReplayId(): string | null {
+    if (!this.enableNative) {
+      debug.warn(`[NATIVE] \`${this.getCurrentReplayId.name}\` is not available when native is disabled.`);
+      return null;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      debug.warn(`[NATIVE] \`${this.getCurrentReplayId.name}\` is not available when native is not available.`);
+      return null;
+    }
+
+    return RNSentry.getCurrentReplayId() || null;
+  },
+
+  startReplay(): Promise<void> {
+    return this._callReplayControl('startReplay');
+  },
+
+  startReplayBuffering(): Promise<void> {
+    return this._callReplayControl('startReplayBuffering');
+  },
+
+  stopReplay(): Promise<void> {
+    return this._callReplayControl('stopReplay');
+  },
+
+  pauseReplay(): Promise<void> {
+    return this._callReplayControl('pauseReplay');
+  },
+
+  resumeReplay(): Promise<void> {
+    return this._callReplayControl('resumeReplay');
+  },
+
+  flushReplay(): Promise<void> {
+    return this._callReplayControl('flushReplay');
+  },
+
+  /**
+   * Invokes a native Session Replay runtime control, degrading gracefully when
+   * native is disabled, the module isn't linked, or the running (possibly
+   * cached, older) native binary predates the method - it never throws.
+   */
+  _callReplayControl(
+    method: 'startReplay' | 'startReplayBuffering' | 'stopReplay' | 'pauseReplay' | 'resumeReplay' | 'flushReplay',
+  ): Promise<void> {
+    if (!this.enableNative) {
+      debug.warn(`[NATIVE] \`${method}\` is not available when native is disabled.`);
+      return Promise.resolve();
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      debug.warn(`[NATIVE] \`${method}\` is not available when native is not available.`);
+      return Promise.resolve();
+    }
+    if (typeof RNSentry[method] !== 'function') {
+      debug.warn(`[NATIVE] \`${method}\` is not available in the current native SDK version.`);
+      return Promise.resolve();
+    }
+
+    return RNSentry[method]();
+  },
+
+  /**
+   * Forwards a trace id seen on a sent event to the native Session Replay so it
+   * lands in the current segment's `trace_ids` (enabling search by trace id).
+   * The native SDKs own dedup, the 100-per-segment cap, and the no-op when no
+   * replay is recording - this is a thin forward. Degrades to a no-op when
+   * native is disabled, unlinked, or the running (possibly cached, older) native
+   * binary predates the method; never throws into the caller.
+   */
+  registerReplayTraceId(traceId: string): void {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry)) {
+      return undefined;
+    }
+    if (typeof RNSentry.registerReplayTraceId !== 'function') {
+      return undefined;
+    }
+
+    try {
+      RNSentry.registerReplayTraceId(traceId);
+    } catch (error) {
+      debug.error('Error:', error);
+      return undefined;
+    }
+  },
+
+  async crashedLastRun(): Promise<boolean | null> {
+    if (!this.enableNative) {
+      return null;
+    }
+    if (!this._isModuleLoaded(RNSentry)) {
+      return null;
+    }
+
+    const result = await RNSentry.crashedLastRun();
+    return typeof result === 'boolean' ? result : null;
+  },
+
+  getNewScreenTimeToDisplay(): Promise<number | null | undefined> {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry)) {
+      return Promise.resolve(null);
+    }
+
+    return RNSentry.getNewScreenTimeToDisplay();
+  },
+
+  async getDataFromUri(uri: string): Promise<Uint8Array | null> {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry)) {
+      return null;
+    }
+    try {
+      const data: number[] = await RNSentry.getDataFromUri(uri);
+      return new Uint8Array(data);
+    } catch (error) {
+      debug.error('Error:', error);
+      return null;
+    }
+  },
+
+  popTimeToDisplayFor(key: string): Promise<number | undefined | null> {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry)) {
+      return Promise.resolve(null);
+    }
+
+    try {
+      return RNSentry.popTimeToDisplayFor(key);
+    } catch (error) {
+      debug.error('Error:', error);
+      return Promise.resolve(null);
+    }
+  },
+
+  setActiveSpanId(spanId): void {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry)) {
+      return undefined;
+    }
+
+    try {
+      RNSentry.setActiveSpanId(spanId);
+    } catch (error) {
+      debug.error('Error:', error);
+      return undefined;
+    }
+  },
+
+  setCurrentScopePropagationContext(ctx): boolean {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry)) {
+      return false;
+    }
+    try {
+      return !!RNSentry.setCurrentScopePropagationContext(ctx);
+    } catch (error) {
+      debug.error('Error:', error);
+      return false;
+    }
+  },
+
+  async encodeToBase64(data: Uint8Array): Promise<string | null> {
+    if (!this.enableNative || !this._isModuleLoaded(RNSentry)) {
+      return Promise.resolve(null);
+    }
+
+    try {
+      const byteArray = Array.from(data);
+      const base64 = await RNSentry.encodeToBase64(byteArray);
+      return base64 || null;
+    } catch (error) {
+      debug.error('Error:', error);
+      return Promise.resolve(null);
+    }
+  },
+
+  primitiveProcessor: function (value: Primitive): string {
+    return value as string;
+  },
+
+  /**
+   * Gets the event from envelopeItem and applies the level filter to the selected event.
+   * @param data An envelope item containing the event.
+   * @returns The event from envelopeItem or undefined.
+   */
+  _processItem(item: EnvelopeItem): EnvelopeItem {
+    const [itemHeader, itemPayload] = item;
+
+    if (itemHeader.type == 'event' || itemHeader.type == 'transaction') {
+      const event = this._processLevels(itemPayload as Event);
+
+      if (NATIVE.platform === 'android') {
+        if ('message' in event) {
+          // @ts-expect-error Android still uses the old message object, without this the serialization of events will break.
+          event.message = { message: event.message };
+        }
+      }
+
+      return [itemHeader, event];
+    }
+
+    return item;
+  },
+
+  /**
+   * Serializes all values of root-level keys into strings.
+   * @param data key-value map.
+   * @returns An object where all root-level values are strings.
+   */
+  _serializeObject(data: { [key: string]: unknown }): { [key: string]: string } {
+    const serialized: { [key: string]: string } = {};
+
+    Object.keys(data).forEach(dataKey => {
+      const value = data[dataKey];
+      serialized[dataKey] = typeof value === 'string' ? value : JSON.stringify(value);
+    });
+
+    return serialized;
+  },
+
+  /**
+   * Convert js severity level in event.level and event.breadcrumbs to more widely supported levels.
+   * @param event
+   * @returns Event with more widely supported Severity level strings
+   */
+  _processLevels(event: Event): Event {
+    const processed: Event = {
+      ...event,
+      level: event.level ? this._processLevel(event.level) : undefined,
+      breadcrumbs: event.breadcrumbs?.map(breadcrumb => ({
+        ...breadcrumb,
+        level: breadcrumb.level ? this._processLevel(breadcrumb.level) : undefined,
+      })),
+    };
+
+    return processed;
+  },
+
+  /**
+   * Convert js severity level which has critical and log to more widely supported levels.
+   * @param level
+   * @returns More widely supported Severity level strings
+   */
+  _processLevel(level: SeverityLevel): SeverityLevel {
+    if (level == ('log' as SeverityLevel)) {
+      return 'debug' as SeverityLevel;
+    }
+    return level;
+  },
+
+  /**
+   * Checks whether the RNSentry module is loaded.
+   */
+  _isModuleLoaded(module: Spec | undefined): module is Spec {
+    return !!module;
+  },
+
+  // oxlint-disable-next-line typescript-eslint(no-explicit-any)
+  _setPrimitiveProcessor: function (processor: (value: Primitive) => any): void {
+    this.primitiveProcessor = processor;
+  },
+
+  _DisabledNativeError: new SentryError('Native is disabled'),
+  _platformProfilers: false,
+
+  _NativeClientError: new SentryError("Native Client is not available, can't start on native."),
+
+  enableNative: true,
+  nativeIsReady: false,
+  platform: Platform.OS,
+};
+
+/**
+ * Fethces the data from the given uri in Uint8Array format.
+ * @param uri string
+ * @returns Uint8Array | null
+ */
+export async function getDataFromUri(uri: string): Promise<Uint8Array | null> {
+  return NATIVE.getDataFromUri(uri);
+}

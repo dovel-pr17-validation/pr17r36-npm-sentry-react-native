@@ -1,0 +1,16 @@
+minVersion: 3.9.0
+versioning:
+  policy: manual
+changelog:
+  policy: auto
+preReleaseCommand: bash scripts/craft-pre-release.sh
+targets:
+  - name: npm
+  - name: github
+  - name: registry
+    sdks:
+      npm:@sentry/react-native:
+        includeNames: /^sentry-react-native-\d.*\.tgz$/
+      npm:@sentry/expo-upload-sourcemaps:
+        name: '@sentry/expo-upload-sourcemaps'
+        includeNames: /^sentry-expo-upload-sourcemaps-\d.*\.tgz$/

@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/lerna/schemas/lerna-schema.json",
+  "version": "8.34.0",
+  "packages": [
+    "packages/*",
+    "dev-packages/*",
+    "samples/*"
+  ],
+  "npmClient": "yarn"
+}

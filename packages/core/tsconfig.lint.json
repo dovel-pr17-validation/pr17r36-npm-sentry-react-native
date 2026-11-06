@@ -1,0 +1,63 @@
+{
+  // Separate tsconfig for oxlint --type-aware (tsgolint).
+  // tsgolint is based on TypeScript 7.0 which removed alwaysStrict.
+  // The parent @sentry-internal/typescript/tsconfig.json sets alwaysStrict: false,
+  // which causes tsgolint to reject the config entirely and silently disable
+  // type-aware linting. This config inlines the needed settings without alwaysStrict.
+  "include": [
+    "src/js/tools/**/*.ts",
+    "src/js/*.ts",
+    "src/js/playground/*.ts",
+    "src/js/playground/*.tsx",
+    "src/js/**/*.web.ts",
+    "src/js/**/*.web.tsx",
+    "src/js/*.tsx",
+    "test/**/*.ts",
+    "test/**/*.tsx",
+    "typings/*.d.ts",
+    "plugin/**/*.ts"
+  ],
+  "exclude": ["dist"],
+  "compilerOptions": {
+    // From @sentry-internal/typescript/tsconfig.json (without alwaysStrict)
+    "declaration": true,
+    "declarationMap": true,
+    "downlevelIteration": true,
+    "inlineSources": true,
+    "isolatedModules": true,
+    "moduleResolution": "node",
+    "noErrorTruncation": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "preserveWatchOutput": true,
+    "sourceMap": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+
+    // From tsconfig.json / tsconfig.build.json
+    "rootDir": ".",
+    "paths": {
+      "metro": ["./node_modules/metro/src/index"],
+      // `@sentry/bundler-plugins` exposes the component-annotate plugin via the `./babel-plugin`
+      // subpath export, which classic `node` resolution can't follow. Point directly at its types.
+      "@sentry/bundler-plugins/babel-plugin": [
+        "./node_modules/@sentry/bundler-plugins/build/types/babel-plugin/index.d.ts"
+      ],
+      // react-native >=0.87 dropped its root `types` field; its type definitions are now only
+      // reachable through the package `exports` map, which classic `node` resolution can't follow.
+      // Point directly at the shipped legacy type definitions (`types_DEPRECATED` since 0.88; what earlier RN versions' root
+      // `types` field resolved to).
+      "react-native": ["./node_modules/react-native/types_DEPRECATED/index.d.ts"]
+    },
+    "lib": ["es7"],
+    "jsx": "react",
+    "types": ["jest"],
+    "target": "es2018",
+    "module": "es6",
+    "skipLibCheck": true,
+    "strictBindCallApply": true,
+    "importHelpers": false
+  }
+}

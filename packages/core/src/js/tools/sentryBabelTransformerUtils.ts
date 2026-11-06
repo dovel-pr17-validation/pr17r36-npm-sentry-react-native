@@ -1,0 +1,144 @@
+import componentAnnotatePlugin from '@sentry/bundler-plugins/babel-plugin';
+import { debug } from '@sentry/core';
+import * as process from 'process';
+
+import type { BabelTransformer, BabelTransformerArgs } from './vendor/metro/metroBabelTransformer';
+
+import sentryExpoRouterAutoWrapBabelPlugin from './sentryExpoRouterAutoWrapBabelPlugin';
+
+export type SentryBabelTransformerOptions = {
+  annotateReactComponents?: {
+    ignoredComponents?: string[];
+    autoInjectSentryLabel?: boolean;
+    textComponentNames?: string[];
+  };
+  autoWrapExpoRouterErrorBoundary?: boolean;
+};
+
+export const SENTRY_DEFAULT_BABEL_TRANSFORMER_PATH = 'SENTRY_DEFAULT_BABEL_TRANSFORMER_PATH';
+export const SENTRY_BABEL_TRANSFORMER_OPTIONS = 'SENTRY_BABEL_TRANSFORMER_OPTIONS';
+
+/**
+ * Sets default Babel transformer path to the environment variables.
+ */
+export function setSentryDefaultBabelTransformerPathEnv(defaultBabelTransformerPath: string): void {
+  process.env[SENTRY_DEFAULT_BABEL_TRANSFORMER_PATH] = defaultBabelTransformerPath;
+  debug.log(`Saved default Babel transformer path ${defaultBabelTransformerPath}`);
+}
+
+/**
+ * Reads default Babel transformer path from the environment variables.
+ */
+export function getSentryDefaultBabelTransformerPathEnv(): string | undefined {
+  return process.env[SENTRY_DEFAULT_BABEL_TRANSFORMER_PATH];
+}
+
+/**
+ * Loads default Babel transformer from `@react-native/metro-config` -> `@react-native/metro-babel-transformer`.
+ */
+export function loadDefaultBabelTransformer(): BabelTransformer {
+  const defaultBabelTransformerPath = getSentryDefaultBabelTransformerPathEnv();
+  if (!defaultBabelTransformerPath) {
+    throw new Error(
+      `Default Babel transformer path environment variable ${SENTRY_DEFAULT_BABEL_TRANSFORMER_PATH} is not set.`,
+    );
+  }
+
+  debug.log(`Loading default Babel transformer from ${defaultBabelTransformerPath}`);
+  return require(defaultBabelTransformerPath);
+}
+
+/**
+ *
+ */
+export function setSentryBabelTransformerOptions(options: SentryBabelTransformerOptions): void {
+  let optionsString: string | null = null;
+  try {
+    debug.log('Stringifying Sentry Babel transformer options', options);
+    optionsString = JSON.stringify(options);
+  } catch (e) {
+    // oxlint-disable-next-line eslint(no-console)
+    console.error('Failed to stringify Sentry Babel transformer options', e);
+  }
+
+  if (!optionsString) {
+    return;
+  }
+
+  debug.log(`Sentry Babel transformer options set to ${SENTRY_BABEL_TRANSFORMER_OPTIONS}`, optionsString);
+  process.env[SENTRY_BABEL_TRANSFORMER_OPTIONS] = optionsString;
+}
+
+/**
+ *
+ */
+export function getSentryBabelTransformerOptions(): SentryBabelTransformerOptions | undefined {
+  const optionsString = process.env[SENTRY_BABEL_TRANSFORMER_OPTIONS];
+  if (!optionsString) {
+    debug.log(`Sentry Babel transformer options environment variable ${SENTRY_BABEL_TRANSFORMER_OPTIONS} is not set`);
+    return undefined;
+  }
+
+  try {
+    debug.log(`Parsing Sentry Babel transformer options from ${optionsString}`);
+    return JSON.parse(optionsString);
+  } catch (e) {
+    // oxlint-disable-next-line eslint(no-console)
+    console.error('Failed to parse Sentry Babel transformer options', e);
+    return undefined;
+  }
+}
+
+/**
+ * Creates a Babel transformer with Sentry component annotation plugin.
+ */
+export function createSentryBabelTransformer(): BabelTransformer {
+  const defaultTransformer = loadDefaultBabelTransformer();
+  const options = getSentryBabelTransformerOptions();
+
+  // Using spread operator to avoid any conflicts with the default transformer
+  const transform: BabelTransformer['transform'] = (...args) => {
+    const transformerArgs = args[0];
+
+    if (options?.annotateReactComponents !== undefined) {
+      addSentryComponentAnnotatePlugin(transformerArgs, options.annotateReactComponents);
+    }
+    if (options?.autoWrapExpoRouterErrorBoundary) {
+      addSentryExpoRouterAutoWrapPlugin(transformerArgs);
+    }
+
+    return defaultTransformer.transform(...args);
+  };
+
+  return {
+    ...defaultTransformer,
+    transform,
+  };
+}
+
+function addSentryComponentAnnotatePlugin(
+  args: BabelTransformerArgs | undefined,
+  options: SentryBabelTransformerOptions['annotateReactComponents'] | undefined,
+): void {
+  if (!args || typeof args.filename !== 'string' || !Array.isArray(args.plugins)) {
+    return undefined;
+  }
+
+  if (!args.filename.includes('node_modules')) {
+    const pluginOptions = {
+      autoInjectSentryLabel: true,
+      ...options,
+    };
+    args.plugins.push([componentAnnotatePlugin, pluginOptions]);
+  }
+}
+
+function addSentryExpoRouterAutoWrapPlugin(args: BabelTransformerArgs | undefined): void {
+  if (!args || typeof args.filename !== 'string' || !Array.isArray(args.plugins)) {
+    return undefined;
+  }
+  if (args.filename.includes('node_modules')) {
+    return undefined;
+  }
+  args.plugins.push([sentryExpoRouterAutoWrapBabelPlugin, {}]);
+}

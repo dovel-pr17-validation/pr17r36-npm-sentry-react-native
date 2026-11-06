@@ -1,0 +1,206 @@
+jest.mock('../../src/js/utils/environment');
+jest.mock('../../src/js/profiling/debugid');
+
+import type { Event } from '@sentry/core';
+
+import type { AndroidCombinedProfileEvent, CombinedProfileEvent } from '../../src/js/profiling/types';
+
+import { getDebugMetadata } from '../../src/js/profiling/debugid';
+import {
+  enrichAndroidProfileWithEventContext,
+  enrichCombinedProfileWithEventContext,
+} from '../../src/js/profiling/utils';
+import { getDefaultEnvironment, getHermesVersion } from '../../src/js/utils/environment';
+import { createMockMinimalValidAndroidProfile, createMockMinimalValidHermesProfileEvent } from './fixtures';
+
+describe('enrichCombinedProfileWithEventContext', () => {
+  beforeEach(() => {
+    (getDefaultEnvironment as jest.Mock).mockReturnValue('production');
+    (getDebugMetadata as jest.Mock).mockReturnValue([]);
+  });
+
+  test('should set the hermes runtime version from getHermesVersion', () => {
+    // OSS Hermes reports the version it was built against, e.g. `for RN 0.76.0`, not a semver.
+    (getHermesVersion as jest.Mock).mockReturnValue('for RN 0.76.0');
+    const profile: CombinedProfileEvent = createMockMinimalValidHermesProfileEvent();
+    const event = createMockEvent();
+
+    const result = enrichCombinedProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.runtime).toEqual({ name: 'hermes', version: 'for RN 0.76.0' });
+  });
+
+  test('should fall back to an empty runtime version when the hermes version is unavailable', () => {
+    (getHermesVersion as jest.Mock).mockReturnValue(undefined);
+    const profile: CombinedProfileEvent = createMockMinimalValidHermesProfileEvent();
+    const event = createMockEvent();
+
+    const result = enrichCombinedProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.runtime).toEqual({ name: 'hermes', version: '' });
+  });
+
+  function createMockEvent(overrides?: Partial<Event>): Event {
+    return {
+      event_id: 'test-event-id',
+      transaction: 'test-transaction',
+      release: 'test-release',
+      environment: 'test-env',
+      start_timestamp: 1000,
+      contexts: {
+        trace: {
+          trace_id: '12345678901234567890123456789012',
+        },
+        os: { name: 'iOS', version: '17.0' },
+        device: {},
+      },
+      ...overrides,
+    };
+  }
+
+  test('should use profilingStartTimestampNs for timestamp when available', () => {
+    const profilingStartTimestampNs = 1500 * 1e9; // 1500 seconds in ns
+    const profile: CombinedProfileEvent = {
+      ...createMockMinimalValidHermesProfileEvent(),
+      profilingStartTimestampNs,
+    };
+    const event = createMockEvent({ start_timestamp: 1000 }); // earlier than profiling start
+
+    const result = enrichCombinedProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.timestamp).toBe(new Date(profilingStartTimestampNs / 1e6).toISOString());
+    // Should NOT use event.start_timestamp
+    expect(result!.timestamp).not.toBe(new Date(1000 * 1000).toISOString());
+  });
+
+  test('should fall back to event.start_timestamp when profilingStartTimestampNs is not set', () => {
+    const profile: CombinedProfileEvent = createMockMinimalValidHermesProfileEvent();
+    const event = createMockEvent({ start_timestamp: 1000 });
+
+    const result = enrichCombinedProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.timestamp).toBe(new Date(1000 * 1000).toISOString());
+  });
+
+  test('should not include profilingStartTimestampNs in the output', () => {
+    const profile: CombinedProfileEvent = {
+      ...createMockMinimalValidHermesProfileEvent(),
+      profilingStartTimestampNs: 1500 * 1e9,
+    };
+    const event = createMockEvent();
+
+    const result = enrichCombinedProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result).not.toHaveProperty('profilingStartTimestampNs');
+  });
+});
+
+describe('enrichAndroidProfileWithEventContext', () => {
+  beforeEach(() => {
+    (getDefaultEnvironment as jest.Mock).mockReturnValue('production');
+    (getDebugMetadata as jest.Mock).mockReturnValue([]);
+  });
+
+  function createMockEvent(overrides?: Partial<Event>): Event {
+    return {
+      event_id: 'test-event-id',
+      transaction: 'test-transaction',
+      release: 'test-release',
+      environment: 'test-env',
+      start_timestamp: 1000,
+      contexts: {
+        trace: {
+          trace_id: '12345678901234567890123456789012',
+        },
+        os: { name: 'Android', version: '14' },
+        device: {},
+      },
+      ...overrides,
+    };
+  }
+
+  function createMockAndroidCombinedProfile(
+    overrides?: Partial<AndroidCombinedProfileEvent>,
+  ): AndroidCombinedProfileEvent {
+    const hermesProfileEvent = createMockMinimalValidHermesProfileEvent();
+    return {
+      platform: 'android',
+      sampled_profile: createMockMinimalValidAndroidProfile().sampled_profile,
+      js_profile: hermesProfileEvent.profile,
+      android_api_level: 34,
+      duration_ns: '1000000',
+      active_thread_id: '123',
+      ...overrides,
+    };
+  }
+
+  test('should use profilingStartTimestampNs for timestamp when available', () => {
+    const profilingStartTimestampNs = 1500 * 1e9;
+    const profile = createMockAndroidCombinedProfile({ profilingStartTimestampNs });
+    const event = createMockEvent({ start_timestamp: 1000 });
+
+    const result = enrichAndroidProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.timestamp).toBe(new Date(profilingStartTimestampNs / 1e6).toISOString());
+    expect(result!.timestamp).not.toBe(new Date(1000 * 1000).toISOString());
+  });
+
+  test('should fall back to event.start_timestamp when profilingStartTimestampNs is not set', () => {
+    const profile = createMockAndroidCombinedProfile();
+    const event = createMockEvent({ start_timestamp: 1000 });
+
+    const result = enrichAndroidProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.timestamp).toBe(new Date(1000 * 1000).toISOString());
+  });
+
+  test('should not include profilingStartTimestampNs in the output', () => {
+    const profile = createMockAndroidCombinedProfile({ profilingStartTimestampNs: 1500 * 1e9 });
+    const event = createMockEvent();
+
+    const result = enrichAndroidProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result).not.toHaveProperty('profilingStartTimestampNs');
+  });
+
+  test('should include measurements when present', () => {
+    const measurements = {
+      cpu_usage: {
+        unit: 'percent' as const,
+        values: [
+          { elapsed_since_start_ns: 0, value: 35.5 },
+          { elapsed_since_start_ns: 5000000, value: 42.1 },
+        ],
+      },
+      memory_footprint: {
+        unit: 'byte' as const,
+        values: [{ elapsed_since_start_ns: 0, value: 104857600 }],
+      },
+    };
+    const profile = createMockAndroidCombinedProfile({ measurements });
+    const event = createMockEvent();
+
+    const result = enrichAndroidProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.measurements).toEqual(measurements);
+  });
+
+  test('should not include measurements when absent', () => {
+    const profile = createMockAndroidCombinedProfile();
+    const event = createMockEvent();
+
+    const result = enrichAndroidProfileWithEventContext('profile-id', profile, event);
+
+    expect(result).not.toBeNull();
+    expect(result!.measurements).toBeUndefined();
+  });
+});

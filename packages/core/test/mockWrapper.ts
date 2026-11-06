@@ -1,0 +1,129 @@
+import type { MockInterface } from './testutils';
+
+import { type NATIVE as ORIGINAL_NATIVE } from '../src/js/wrapper';
+
+type NativeType = typeof ORIGINAL_NATIVE;
+
+const NATIVE: MockInterface<NativeType> = {
+  enableNative: true,
+  nativeIsReady: true,
+  platform: 'ios',
+
+  _NativeClientError: new Error('MockNative client is not available'),
+  _DisabledNativeError: new Error('MockNative is disabled'),
+
+  _processItem: jest.fn(),
+  _processLevels: jest.fn(),
+  _processLevel: jest.fn(),
+  _serializeObject: jest.fn(),
+  _isModuleLoaded: <NativeType['_isModuleLoaded'] & jest.Mock>jest.fn(),
+  _callReplayControl: jest.fn(),
+  _setPrimitiveProcessor: jest.fn(),
+
+  isNativeAvailable: jest.fn(),
+
+  initNativeSdk: jest.fn(),
+  closeNativeSdk: jest.fn(),
+
+  sendEnvelope: jest.fn(),
+  captureScreenshot: jest.fn(),
+
+  fetchNativeRelease: jest.fn(),
+  fetchNativeDeviceContexts: jest.fn(),
+  fetchNativeAppStart: jest.fn(),
+  fetchNativeFrames: jest.fn(),
+  fetchNativeFramesDelay: jest.fn(),
+  fetchNativeSdkInfo: jest.fn(),
+
+  disableNativeFramesTracking: jest.fn(),
+  enableNativeFramesTracking: jest.fn(),
+  pauseAppHangTracking: jest.fn(),
+  resumeAppHangTracking: jest.fn(),
+  startJsHangTracking: jest.fn(),
+  stopJsHangTracking: jest.fn(),
+
+  addBreadcrumb: jest.fn(),
+  setContext: jest.fn(),
+  clearBreadcrumbs: jest.fn(),
+  setExtra: jest.fn(),
+  setUser: jest.fn(),
+  setTag: jest.fn(),
+  setAttribute: jest.fn(),
+  setAttributes: jest.fn(),
+  removeAttribute: jest.fn(),
+
+  nativeCrash: jest.fn(),
+
+  fetchModules: jest.fn(),
+  fetchViewHierarchy: jest.fn(),
+
+  startProfiling: jest.fn(),
+  stopProfiling: jest.fn(),
+  startProfiler: jest.fn(),
+  stopProfiler: jest.fn(),
+  getCurrentThreadId: jest.fn(),
+
+  fetchNativePackageName: jest.fn(),
+  fetchNativeStackFramesBy: jest.fn(),
+
+  initNativeReactNavigationNewFrameTracking: jest.fn(),
+
+  captureReplay: jest.fn(),
+  getCurrentReplayId: jest.fn(),
+  startReplay: jest.fn(),
+  startReplayBuffering: jest.fn(),
+  stopReplay: jest.fn(),
+  pauseReplay: jest.fn(),
+  resumeReplay: jest.fn(),
+  flushReplay: jest.fn(),
+  registerReplayTraceId: jest.fn(),
+
+  crashedLastRun: jest.fn(),
+  getNewScreenTimeToDisplay: jest.fn(),
+  getDataFromUri: jest.fn(),
+  popTimeToDisplayFor: jest.fn(),
+  setActiveSpanId: jest.fn(),
+  setCurrentScopePropagationContext: jest.fn(),
+  encodeToBase64: jest.fn(),
+  primitiveProcessor: jest.fn(),
+};
+
+NATIVE.isNativeAvailable.mockReturnValue(true);
+NATIVE.initNativeSdk.mockResolvedValue(true);
+NATIVE.captureScreenshot.mockResolvedValue(null);
+NATIVE.fetchNativeRelease.mockResolvedValue({
+  version: 'mock-native-version',
+  build: 'mock-native-build',
+  id: 'mock-native-id',
+});
+NATIVE.fetchNativeDeviceContexts.mockResolvedValue({});
+NATIVE.fetchNativeAppStart.mockResolvedValue(null);
+NATIVE.fetchNativeFrames.mockResolvedValue(null);
+NATIVE.fetchNativeFramesDelay.mockResolvedValue(null);
+NATIVE.fetchNativeSdkInfo.mockResolvedValue(null);
+NATIVE.fetchModules.mockResolvedValue(null);
+NATIVE.fetchViewHierarchy.mockResolvedValue(null);
+NATIVE.startProfiling.mockReturnValue(false);
+NATIVE.stopProfiling.mockReturnValue(null);
+NATIVE.startProfiler.mockResolvedValue(null);
+NATIVE.stopProfiler.mockResolvedValue(undefined);
+NATIVE.getCurrentThreadId.mockReturnValue(null);
+NATIVE.fetchNativePackageName.mockReturnValue('mock-native-package-name');
+NATIVE.fetchNativeStackFramesBy.mockReturnValue(null);
+NATIVE.initNativeReactNavigationNewFrameTracking.mockReturnValue(Promise.resolve());
+NATIVE.captureReplay.mockResolvedValue(null);
+NATIVE.getCurrentReplayId.mockReturnValue(null);
+NATIVE.startReplay.mockResolvedValue(undefined);
+NATIVE.startReplayBuffering.mockResolvedValue(undefined);
+NATIVE.stopReplay.mockResolvedValue(undefined);
+NATIVE.pauseReplay.mockResolvedValue(undefined);
+NATIVE.resumeReplay.mockResolvedValue(undefined);
+NATIVE.flushReplay.mockResolvedValue(undefined);
+NATIVE.crashedLastRun.mockResolvedValue(false);
+NATIVE.popTimeToDisplayFor.mockResolvedValue(null);
+NATIVE.getNewScreenTimeToDisplay.mockResolvedValue(null);
+NATIVE.primitiveProcessor.mockReturnValue('');
+NATIVE.fetchNativeLogAttributes = jest.fn().mockResolvedValue({});
+export const getRNSentryModule = jest.fn();
+
+export { NATIVE };

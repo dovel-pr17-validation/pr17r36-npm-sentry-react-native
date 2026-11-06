@@ -1,0 +1,158 @@
+package io.sentry.rnsentryandroidtester
+
+import com.facebook.react.bridge.JavaOnlyMap
+import io.sentry.ILogger
+import io.sentry.SentryLevel
+import io.sentry.react.RNSentryBreadcrumb
+import junit.framework.TestCase.assertEquals
+import junit.framework.TestCase.assertNotNull
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.junit.runners.JUnit4
+import org.mockito.Mockito
+
+@RunWith(JUnit4::class)
+class RNSentryBreadcrumbTest {
+    private val logger = Mockito.mock(ILogger::class.java)
+
+    @Test
+    fun generatesSentryBreadcrumbFromMap() {
+        val testData =
+            JavaOnlyMap.of(
+                "test",
+                "data",
+            )
+        val map =
+            JavaOnlyMap.of(
+                "level",
+                "error",
+                "category",
+                "testCategory",
+                "origin",
+                "testOrigin",
+                "type",
+                "testType",
+                "message",
+                "testMessage",
+                "data",
+                testData,
+            )
+        val actual = RNSentryBreadcrumb.fromMap(map, logger)
+        assertEquals(SentryLevel.ERROR, actual.level)
+        assertEquals("testCategory", actual.category)
+        assertEquals("testOrigin", actual.origin)
+        assertEquals("testType", actual.type)
+        assertEquals("testMessage", actual.message)
+        assertEquals(testData.toHashMap(), actual.data)
+    }
+
+    @Test
+    fun defaultsToInfoLevelWhenMissing() {
+        val map =
+            JavaOnlyMap.of(
+                "message",
+                "testMessage",
+            )
+        val actual = RNSentryBreadcrumb.fromMap(map, logger)
+        assertEquals(SentryLevel.INFO, actual.level)
+    }
+
+    @Test
+    fun setsTimestamp() {
+        val map =
+            JavaOnlyMap.of(
+                "message",
+                "testMessage",
+            )
+        val actual = RNSentryBreadcrumb.fromMap(map, logger)
+        assertNotNull(actual.timestamp)
+    }
+
+    @Test
+    fun parsesNumericTimestampWithoutDiscardingBreadcrumb() {
+        // The JS SDK stamps `timestamp` as a number (epoch seconds), which arrives over the bridge
+        // as a Double. The native deserializer expects an ISO-8601 string, so without normalization
+        // this throws a ClassCastException and the whole breadcrumb is discarded (see #6306).
+        val map = JavaOnlyMap()
+        map.putString("message", "testMessage")
+        map.putDouble("timestamp", 1_700_000_000.5)
+        val actual = RNSentryBreadcrumb.fromMap(map, logger)
+        assertEquals("testMessage", actual.message)
+        assertEquals("react-native", actual.origin)
+        assertNotNull(actual.timestamp)
+        assertEquals(1_700_000_000_500L, actual.timestamp.time)
+    }
+
+    @Test
+    fun reactNativeForMissingOrigin() {
+        val map =
+            JavaOnlyMap.of(
+                "message",
+                "testMessage",
+            )
+        val actual = RNSentryBreadcrumb.fromMap(map, logger)
+        assertEquals("testMessage", actual.message)
+        assertEquals("react-native", actual.origin)
+    }
+
+    @Test
+    fun nullForMissingCategory() {
+        val map = JavaOnlyMap.of()
+        val actual = RNSentryBreadcrumb.getCurrentScreenFrom(map)
+        assertEquals(null, actual)
+    }
+
+    @Test
+    fun nullForNonNavigationCategory() {
+        val map =
+            JavaOnlyMap.of(
+                "category",
+                "unknown",
+            )
+        val actual = RNSentryBreadcrumb.getCurrentScreenFrom(map)
+        assertEquals(null, actual)
+    }
+
+    @Test
+    fun nullForMissingData() {
+        val map =
+            JavaOnlyMap.of(
+                "category",
+                "navigation",
+            )
+        val actual = RNSentryBreadcrumb.getCurrentScreenFrom(map)
+        assertEquals(null, actual)
+    }
+
+    @Test
+    fun nullForNonStringDataToKey() {
+        val map =
+            JavaOnlyMap.of(
+                "category",
+                "unknown",
+                "data",
+                mapOf(
+                    "to" to 123,
+                ),
+            )
+        val actual = RNSentryBreadcrumb.getCurrentScreenFrom(map)
+        assertEquals(null, actual)
+    }
+
+    @Test
+    fun screenNameForValidNavigationBreadcrumb() {
+        val map =
+            JavaOnlyMap.of(
+                "category",
+                "navigation",
+                "data",
+                JavaOnlyMap.of(
+                    "to",
+                    "newScreen",
+                ),
+            )
+        val actual = RNSentryBreadcrumb.getCurrentScreenFrom(map)
+        assert(actual is String)
+        assertEquals("newScreen", actual)
+    }
+}

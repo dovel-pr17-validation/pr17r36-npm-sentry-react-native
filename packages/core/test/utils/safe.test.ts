@@ -1,0 +1,115 @@
+import { safeFactory, safeTracesSampler } from '../../src/js/utils/safe';
+
+describe('safe', () => {
+  describe('safeFactory', () => {
+    test('calls given function with correct args', () => {
+      const mockFn = jest.fn();
+      const actualSafeFunction = safeFactory(mockFn);
+      actualSafeFunction('foo', 'bar');
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(mockFn).toHaveBeenCalledWith('foo', 'bar');
+    });
+    test('calls given function amd return its result', () => {
+      const mockFn = jest.fn(() => 'bar');
+      const actualSafeFunction = safeFactory(mockFn);
+      const actualResult = actualSafeFunction('foo');
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(actualResult).toBe('bar');
+    });
+    test('passes undefined trough', () => {
+      const actualSafeFunction = safeFactory(undefined);
+      expect(actualSafeFunction).not.toBeDefined();
+    });
+    test('passes object trough', () => {
+      const actualSafeFunction = safeFactory({ foo: 'bar' });
+      expect(actualSafeFunction).toEqual({ foo: 'bar' });
+    });
+    test('returns input object if function failed', () => {
+      const mockFn = jest.fn(() => {
+        throw 'Test error';
+      });
+      const actualSafeFunction = safeFactory(<(foo: string) => string>mockFn);
+      const actualResult = actualSafeFunction('foo');
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(actualResult).toEqual('foo');
+    });
+    test('returns onError result if function failed and onError is provided', () => {
+      const mockFn = jest.fn(() => {
+        throw 'Test error';
+      });
+      const actualSafeFunction = safeFactory(<(foo: string) => string | null>mockFn, {
+        onError: () => null,
+      });
+      const actualResult = actualSafeFunction('foo');
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(actualResult).toBeNull();
+    });
+  });
+  describe('safeTracesSampler', () => {
+    test('calls given function with correct args', () => {
+      const mockFn = jest.fn();
+      const actualSafeFunction = safeTracesSampler(mockFn, undefined);
+      const expectedInheritOrSampleWith = function (fallbackSampleRate: number): number {
+        return fallbackSampleRate;
+      };
+      actualSafeFunction?.({
+        name: 'foo',
+        transactionContext: { name: 'foo' },
+        inheritOrSampleWith: expectedInheritOrSampleWith,
+      });
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(mockFn).toHaveBeenCalledWith({
+        name: 'foo',
+        transactionContext: { name: 'foo' },
+        inheritOrSampleWith: expectedInheritOrSampleWith,
+      });
+    });
+    test('calls given function amd return its result', () => {
+      const mockFn = jest.fn(() => 0.5);
+      const actualSafeFunction = safeTracesSampler(mockFn, undefined);
+      const actualResult = actualSafeFunction?.({
+        name: 'foo',
+        transactionContext: { name: 'foo' },
+        inheritOrSampleWith: function (fallbackSampleRate: number): number {
+          return fallbackSampleRate;
+        },
+      });
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(actualResult).toBe(0.5);
+    });
+    test('passes undefined trough', () => {
+      const actualSafeFunction = safeTracesSampler(undefined, undefined);
+      expect(actualSafeFunction).not.toBeDefined();
+    });
+    test('falls back to the configured tracesSampleRate if the function failed', () => {
+      const mockFn = jest.fn(() => {
+        throw 'Test error';
+      });
+      const actualSafeFunction = safeTracesSampler(mockFn, 0.25);
+      const actualResult = actualSafeFunction?.({
+        name: 'foo',
+        transactionContext: { name: 'foo' },
+        inheritOrSampleWith: function (fallbackSampleRate: number): number {
+          return fallbackSampleRate;
+        },
+      });
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(actualResult).toEqual(0.25);
+    });
+    test('returns undefined if the function failed and no tracesSampleRate is configured', () => {
+      const mockFn = jest.fn(() => {
+        throw 'Test error';
+      });
+      const actualSafeFunction = safeTracesSampler(mockFn, undefined);
+      const actualResult = actualSafeFunction?.({
+        name: 'foo',
+        transactionContext: { name: 'foo' },
+        inheritOrSampleWith: function (fallbackSampleRate: number): number {
+          return fallbackSampleRate;
+        },
+      });
+      expect(mockFn).toHaveBeenCalledTimes(1);
+      expect(actualResult).toBeUndefined();
+    });
+  });
+});

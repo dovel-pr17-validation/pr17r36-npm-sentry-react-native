@@ -1,0 +1,519 @@
+/* oxlint-disable eslint(max-lines) */
+import type { MetroConfig, MixedOutput, Module, ReadOnlyGraph } from 'metro';
+import type { CustomResolutionContext, CustomResolver, Resolution } from 'metro-resolver';
+
+import { debug } from '@sentry/core';
+import * as process from 'process';
+import { env } from 'process';
+
+import type { MetroCustomSerializer } from './utils';
+import type { DefaultConfigOptions } from './vendor/expo/expoconfig';
+
+import { enableLogger } from './enableLogger';
+import { withSentryMiddleware } from './metroMiddleware';
+import {
+  setSentryBabelTransformerOptions,
+  setSentryDefaultBabelTransformerPathEnv,
+} from './sentryBabelTransformerUtils';
+import { checkSentryExpoNativeProject } from './sentryExpoNativeCheck';
+import {
+  createSentryMetroSerializer,
+  unstableBeforeAssetSerializationDebugIdPlugin,
+  unstableBeforeAssetSerializationModuleMetadataPlugin,
+} from './sentryMetroSerializer';
+import { withSentryOptionsFromFile } from './sentryOptionsSerializer';
+import { unstableReleaseConstantsPlugin } from './sentryReleaseInjector';
+import { buildModuleMetadata } from './utils';
+
+export * from './sentryMetroSerializer';
+
+enableLogger();
+
+export interface SentryMetroConfigOptions {
+  /**
+   * Annotates React components with Sentry data.
+   * @default false
+   */
+  annotateReactComponents?:
+    | boolean
+    | {
+        ignoredComponents?: string[];
+        /**
+         * Automatically inject `sentry-label` props from static text content.
+         * When enabled, the Babel plugin extracts text from children of touchable
+         * components and injects it as a `sentry-label` prop at build time.
+         *
+         * @default true when `annotateReactComponents` is enabled
+         */
+        autoInjectSentryLabel?: boolean;
+        /**
+         * Component names whose children's text content should be used for
+         * `sentry-label` injection. Useful for apps with custom text wrapper
+         * components.
+         *
+         * @default ['Text']
+         */
+        textComponentNames?: string[];
+      };
+  /**
+   * Adds the Sentry replay package for web.
+   * @default true
+   */
+  includeWebReplay?: boolean;
+  /**
+   * Adds the Sentry user feedback widget package.
+   * @default true
+   */
+  includeWebFeedback?: boolean;
+  /**
+   * Add Sentry Metro Server Middleware which
+   * enables the app to fetch stack frames source context.
+   * @default true
+   */
+  enableSourceContextInDevelopment?: boolean;
+  /**
+   * Load Sentry Options from a file. If `true` it will use the default path.
+   * If `false` it will not load any options from a file. Only options provided in the code will be used.
+   * If `string` it will use the provided path.
+   *
+   * @default '{projectRoot}/sentry.options.json'
+   */
+  optionsFile?: string | boolean;
+  /**
+   * Auto-wrap Expo Router's per-route `ErrorBoundary` re-exports with
+   * `Sentry.wrapExpoRouterErrorBoundary` at build time so render-phase errors
+   * that hit the fallback are captured without requiring the user to change
+   * their route files.
+   *
+   * Detects `export { ErrorBoundary } from 'expo-router'` (and aliased
+   * variants) in non-`node_modules` files and rewrites them to import the
+   * wrapped boundary instead. Files that already import
+   * `wrapExpoRouterErrorBoundary` are left untouched.
+   *
+   * @default false
+   */
+  autoWrapExpoRouterErrorBoundary?: boolean;
+  /**
+   * A key that identifies the code of your application.
+   * Use the same key in the `filterKeys` option of `thirdPartyErrorFilterIntegration`
+   * to filter errors that come from third-party code, for example browser extensions.
+   *
+   * This is the same option as `applicationKey` of the Sentry bundler plugins.
+   */
+  applicationKey?: string;
+  /**
+   * Metadata to attach to the stack frames of your application code.
+   * The SDK adds the metadata to the `module_metadata` field of each stack frame from your bundle.
+   *
+   * This is the same option as the object form of `moduleMetadata` of the Sentry bundler plugins.
+   */
+  moduleMetadata?: Record<string, unknown>;
+}
+
+export interface SentryExpoConfigOptions {
+  /**
+   * Pass a custom `getDefaultConfig` function to override the default Expo configuration getter.
+   */
+  getDefaultConfig?: (projectRoot: string, options?: Record<string, unknown>) => Record<string, unknown>;
+
+  /**
+   * For Expo Web, inject `release` and `version` options from `app.json`, the Expo Application Config.
+   *
+   * @default true
+   */
+  injectReleaseForWeb?: boolean;
+}
+
+/**
+ * Adds Sentry to the Metro config.
+ *
+ * Adds Debug ID to the output bundle and source maps.
+ * Collapses Sentry frames from the stack trace view in LogBox.
+ */
+export function withSentryConfig(
+  config: MetroConfig,
+  {
+    annotateReactComponents = false,
+    includeWebReplay = true,
+    includeWebFeedback = true,
+    enableSourceContextInDevelopment = true,
+    optionsFile = true,
+    autoWrapExpoRouterErrorBoundary = false,
+    applicationKey,
+    moduleMetadata,
+  }: SentryMetroConfigOptions = {},
+): MetroConfig {
+  setSentryMetroDevServerEnvFlag();
+
+  let newConfig = config;
+
+  newConfig = withSentryDebugId(newConfig, buildModuleMetadata({ applicationKey, moduleMetadata }));
+  newConfig = withSentryFramesCollapsed(newConfig);
+  if (annotateReactComponents || autoWrapExpoRouterErrorBoundary) {
+    newConfig = withSentryBabelTransformer(newConfig, annotateReactComponents, autoWrapExpoRouterErrorBoundary);
+  }
+  if (includeWebReplay === false) {
+    newConfig = withSentryResolver(newConfig, includeWebReplay);
+  }
+  if (includeWebFeedback === false) {
+    newConfig = withSentryFeedbackResolver(newConfig, includeWebFeedback);
+  }
+  newConfig = withSentryExcludeServerOnlyResolver(newConfig);
+  if (enableSourceContextInDevelopment) {
+    newConfig = withSentryMiddleware(newConfig);
+  }
+  if (optionsFile) {
+    newConfig = withSentryOptionsFromFile(newConfig, optionsFile);
+  }
+
+  return newConfig;
+}
+
+/**
+ * This function returns Default Expo configuration with Sentry plugins.
+ */
+export function getSentryExpoConfig(
+  projectRoot: string,
+  options: DefaultConfigOptions & SentryExpoConfigOptions & SentryMetroConfigOptions = {},
+): MetroConfig {
+  setSentryMetroDevServerEnvFlag();
+
+  checkSentryExpoNativeProject(projectRoot);
+
+  const getDefaultConfig = options.getDefaultConfig || loadExpoMetroConfigModule().getDefaultConfig;
+  const moduleMetadata = buildModuleMetadata(options);
+  const config = getDefaultConfig(projectRoot, {
+    ...options,
+    unstable_beforeAssetSerializationPlugins: [
+      ...(options.unstable_beforeAssetSerializationPlugins || []),
+      ...((options.injectReleaseForWeb ?? true) ? [unstableReleaseConstantsPlugin(projectRoot)] : []),
+      ...(moduleMetadata ? [unstableBeforeAssetSerializationModuleMetadataPlugin(moduleMetadata)] : []),
+      unstableBeforeAssetSerializationDebugIdPlugin,
+    ],
+  });
+
+  let newConfig = withSentryFramesCollapsed(config);
+  const autoWrapExpoRouterErrorBoundary = options.autoWrapExpoRouterErrorBoundary ?? false;
+  if (options.annotateReactComponents || autoWrapExpoRouterErrorBoundary) {
+    newConfig = withSentryBabelTransformer(
+      newConfig,
+      options.annotateReactComponents ?? false,
+      autoWrapExpoRouterErrorBoundary,
+    );
+  }
+
+  if (options.includeWebReplay === false) {
+    newConfig = withSentryResolver(newConfig, options.includeWebReplay);
+  }
+  if (options.includeWebFeedback === false) {
+    newConfig = withSentryFeedbackResolver(newConfig, options.includeWebFeedback);
+  }
+  newConfig = withSentryExcludeServerOnlyResolver(newConfig);
+
+  if (options.enableSourceContextInDevelopment ?? true) {
+    newConfig = withSentryMiddleware(newConfig);
+  }
+
+  if (options.optionsFile ?? true) {
+    newConfig = withSentryOptionsFromFile(newConfig, options.optionsFile ?? true);
+  }
+
+  return newConfig;
+}
+
+function loadExpoMetroConfigModule(): {
+  getDefaultConfig: (
+    projectRoot: string,
+    options: {
+      unstable_beforeAssetSerializationPlugins?: ((serializationInput: {
+        graph: ReadOnlyGraph<MixedOutput>;
+        premodules: Module[];
+        debugId?: string;
+      }) => Module[])[];
+    },
+  ) => MetroConfig;
+} {
+  try {
+    return require('expo/metro-config');
+  } catch (e) {
+    throw new Error('Unable to load `expo/metro-config`. Make sure you have Expo installed.');
+  }
+}
+
+/**
+ * Adds Sentry Babel transformer to the Metro config.
+ */
+export function withSentryBabelTransformer(
+  config: MetroConfig,
+  annotateReactComponents:
+    | boolean
+    | { ignoredComponents?: string[]; autoInjectSentryLabel?: boolean; textComponentNames?: string[] },
+  autoWrapExpoRouterErrorBoundary: boolean = false,
+): MetroConfig {
+  const defaultBabelTransformerPath = config.transformer?.babelTransformerPath;
+  debug.log('Default Babel transformer path from `config.transformer`:', defaultBabelTransformerPath);
+
+  if (!defaultBabelTransformerPath) {
+    // This has to be console.warn because the options is enabled but won't be used
+    // oxlint-disable-next-line eslint(no-console)
+    console.warn('`transformer.babelTransformerPath` is undefined.');
+    // oxlint-disable-next-line eslint(no-console)
+    console.warn('Sentry Babel transformer cannot be used. Not adding it...');
+    return config;
+  }
+
+  if (defaultBabelTransformerPath) {
+    setSentryDefaultBabelTransformerPathEnv(defaultBabelTransformerPath);
+  }
+
+  setSentryBabelTransformerOptions({
+    ...(annotateReactComponents
+      ? { annotateReactComponents: typeof annotateReactComponents === 'object' ? annotateReactComponents : {} }
+      : {}),
+    autoWrapExpoRouterErrorBoundary,
+  });
+
+  return {
+    ...config,
+    transformer: {
+      ...config.transformer,
+      babelTransformerPath: require.resolve('./sentryBabelTransformer'),
+    },
+  };
+}
+
+function withSentryDebugId(config: MetroConfig, moduleMetadata?: Record<string, unknown>): MetroConfig {
+  const customSerializer = createSentryMetroSerializer(config.serializer?.customSerializer || undefined, {
+    moduleMetadata,
+  }) as MetroCustomSerializer;
+  // MetroConfig types customSerializers as async only, but sync returns are also supported
+  // The default serializer is sync
+
+  return {
+    ...config,
+    serializer: {
+      ...config.serializer,
+      customSerializer,
+    },
+  };
+}
+
+// Based on: https://github.com/facebook/metro/blob/c21daba415ea26511e157f794689caab9abe8236/packages/metro-resolver/src/resolve.js#L86-L91
+type CustomResolverBeforeMetro068 = (
+  context: CustomResolutionContext,
+  realModuleName: string,
+  platform: string | null,
+  moduleName?: string,
+) => Resolution;
+
+/**
+ * Builds a Metro resolver that returns `{ type: 'empty' }` for Sentry sub-packages
+ * matching `moduleRegex` when the user opts out on web or the platform is native.
+ */
+function buildSentryPackageExcludeResolver(
+  config: MetroConfig,
+  includePackage: boolean | undefined,
+  shouldExcludeModule: (moduleName: string, context: CustomResolutionContext) => boolean,
+  optionName: string,
+): MetroConfig {
+  const originalResolver = config.resolver?.resolveRequest as CustomResolver | CustomResolverBeforeMetro068 | undefined;
+
+  const resolverRequest: CustomResolver = (
+    context: CustomResolutionContext,
+    moduleName: string,
+    platform: string | null,
+    oldMetroModuleName?: string,
+  ) => {
+    if (
+      (includePackage === false || (includePackage === undefined && (platform === 'android' || platform === 'ios'))) &&
+      shouldExcludeModule(oldMetroModuleName ?? moduleName, context)
+    ) {
+      return { type: 'empty' } as Resolution;
+    }
+    if (originalResolver) {
+      return oldMetroModuleName
+        ? originalResolver(context, moduleName, platform, oldMetroModuleName)
+        : originalResolver(context, moduleName, platform);
+    }
+
+    // Prior 0.68, context.resolveRequest is resolverRequest itself, where on later version it is the default resolver.
+    if (context.resolveRequest === resolverRequest) {
+      // oxlint-disable-next-line eslint(no-console)
+      console.error(
+        `Error: [@sentry/react-native/metro] Can not resolve the defaultResolver on Metro older than 0.68.
+Please follow one of the following options:
+- Include your resolverRequest on your metroconfig.
+- Update your Metro version to 0.68 or higher.
+- Set ${optionName} as true on your metro config.
+- If you are still facing issues, report the issue at http://www.github.com/getsentry/sentry-react-native/issues`,
+      );
+      // Return required for test.
+      return process.exit(-1);
+    }
+
+    return context.resolveRequest(context, moduleName, platform);
+  };
+
+  return {
+    ...config,
+    resolver: {
+      ...config.resolver,
+      resolveRequest: resolverRequest,
+    },
+  };
+}
+
+/**
+ * Includes `@sentry/replay` packages based on the `includeWebReplay` flag and current bundle `platform`.
+ */
+export function withSentryResolver(config: MetroConfig, includeWebReplay: boolean | undefined): MetroConfig {
+  return buildSentryPackageExcludeResolver(
+    config,
+    includeWebReplay,
+    moduleName => /@sentry(?:-internal)?\/replay/.test(moduleName),
+    'includeWebReplay',
+  );
+}
+
+/**
+ * `@sentry/browser` re-exports feedback through `feedbackSync.js` and `feedbackAsync.js`
+ * which call `buildFeedbackIntegration()` at module evaluation time.
+ * Stubbing only `@sentry-internal/feedback` makes that call crash,
+ * so we also stub these wrapper modules.
+ */
+const SENTRY_BROWSER_FEEDBACK_WRAPPER_RE = /\/feedback(Sync|Async)/;
+
+function isFromSentryBrowser(originModulePath: string): boolean {
+  return /[\\/]@sentry[\\/]browser[\\/]/.test(originModulePath);
+}
+
+/**
+ * Includes `@sentry-internal/feedback` packages based on the `includeWebFeedback` flag and current bundle `platform`.
+ */
+export function withSentryFeedbackResolver(config: MetroConfig, includeWebFeedback: boolean | undefined): MetroConfig {
+  return buildSentryPackageExcludeResolver(
+    config,
+    includeWebFeedback,
+    (moduleName, context) =>
+      /@sentry(?:-internal)?\/feedback/.test(moduleName) ||
+      (isFromSentryBrowser((context as { originModulePath?: string }).originModulePath ?? '') &&
+        SENTRY_BROWSER_FEEDBACK_WRAPPER_RE.test(moduleName)),
+    'includeWebFeedback',
+  );
+}
+
+/**
+ * Matches relative import paths to server-only modules within `@sentry/core`.
+ *
+ * Metro passes the module name as-written in the source code, so for imports inside
+ * `@sentry/core`'s barrel file like `export { ... } from './integrations/mcp-server/index.js'`,
+ * the `moduleName` will be `./integrations/mcp-server/index.js`.
+ */
+const SERVER_ONLY_MODULE_RE =
+  /\/(mcp-server|integrations\/(http|express|postgresjs|requestdata|consola|spanStreaming)|tracing\/(vercel-ai|openai|anthropic-ai|google-genai|langchain|langgraph)|utils\/ai)(\/|\.js|$)/;
+
+function isFromSentryCore(originModulePath: string): boolean {
+  return /[\\/]@sentry[\\/]core[\\/]/.test(originModulePath);
+}
+
+/**
+ * Excludes server-only AI/MCP modules from native (Android/iOS) bundles.
+ */
+export function withSentryExcludeServerOnlyResolver(config: MetroConfig): MetroConfig {
+  const originalResolver = config.resolver?.resolveRequest as CustomResolver | CustomResolverBeforeMetro068 | undefined;
+
+  const sentryServerOnlyResolverRequest: CustomResolver = (
+    context: CustomResolutionContext,
+    moduleName: string,
+    platform: string | null,
+    oldMetroModuleName?: string,
+  ) => {
+    if (
+      (platform === 'android' || platform === 'ios') &&
+      isFromSentryCore((context as { originModulePath?: string }).originModulePath ?? '') &&
+      SERVER_ONLY_MODULE_RE.test(oldMetroModuleName ?? moduleName)
+    ) {
+      return { type: 'empty' } as Resolution;
+    }
+    if (originalResolver) {
+      return oldMetroModuleName
+        ? originalResolver(context, moduleName, platform, oldMetroModuleName)
+        : originalResolver(context, moduleName, platform);
+    }
+
+    // Prior 0.68, context.resolveRequest is sentryServerOnlyResolverRequest itself, which would cause infinite recursion.
+    if (context.resolveRequest === sentryServerOnlyResolverRequest) {
+      // oxlint-disable-next-line eslint(no-console)
+      console.error(
+        `Error: [@sentry/react-native/metro] Can not resolve the defaultResolver on Metro older than 0.68.
+Please include your resolverRequest on your metroconfig or update your Metro version to 0.68 or higher.
+If you are still facing issues, report the issue at http://www.github.com/getsentry/sentry-react-native/issues`,
+      );
+      // Return required for test.
+      return process.exit(-1);
+    }
+
+    return context.resolveRequest(context, moduleName, platform);
+  };
+
+  return {
+    ...config,
+    resolver: {
+      ...config.resolver,
+      resolveRequest: sentryServerOnlyResolverRequest,
+    },
+  };
+}
+
+type MetroFrame = Parameters<Required<Required<MetroConfig>['symbolicator']>['customizeFrame']>[0];
+type MetroCustomizeFrame = { readonly collapse?: boolean };
+type MetroCustomizeFrameReturnValue =
+  | ReturnType<Required<Required<MetroConfig>['symbolicator']>['customizeFrame']>
+  | undefined;
+
+/**
+ * Collapses Sentry internal frames from the stack trace view in LogBox.
+ */
+export function withSentryFramesCollapsed(config: MetroConfig): MetroConfig {
+  const originalCustomizeFrame = config.symbolicator?.customizeFrame;
+  const collapseSentryInternalFrames = (frame: MetroFrame): boolean =>
+    typeof frame.file === 'string' &&
+    (frame.file.includes('node_modules/@sentry/core/cjs/instrument.js') ||
+      frame.file.includes('node_modules/@sentry/core/cjs/debug.js'));
+
+  const customizeFrame = (frame: MetroFrame): MetroCustomizeFrameReturnValue => {
+    const originalOrSentryCustomizeFrame = (
+      originalCustomization: MetroCustomizeFrame | null | undefined,
+    ): MetroCustomizeFrame => ({
+      ...originalCustomization,
+      collapse: originalCustomization?.collapse || collapseSentryInternalFrames(frame),
+    });
+
+    const maybePromiseCustomization = originalCustomizeFrame?.(frame) || undefined;
+
+    if (maybePromiseCustomization !== undefined && 'then' in maybePromiseCustomization) {
+      return maybePromiseCustomization.then<MetroCustomizeFrame>(originalCustomization =>
+        originalOrSentryCustomizeFrame(originalCustomization),
+      );
+    }
+
+    return originalOrSentryCustomizeFrame(maybePromiseCustomization);
+  };
+
+  return {
+    ...config,
+    symbolicator: {
+      ...config.symbolicator,
+      customizeFrame,
+    },
+  };
+}
+
+/**
+ * Sets the `___SENTRY_METRO_DEV_SERVER___` environment flag.
+ * This is used to determine if the SDK is running in Node in Metro Dev Server.
+ * For example during static routes generation in `expo-router`.
+ */
+function setSentryMetroDevServerEnvFlag(): void {
+  env.___SENTRY_METRO_DEV_SERVER___ = 'true';
+}

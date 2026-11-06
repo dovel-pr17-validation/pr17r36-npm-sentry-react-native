@@ -1,0 +1,1470 @@
+import type { Breadcrumb, BreadcrumbHint, Integration, Scope } from '@sentry/core';
+
+import { debug, initAndBind } from '@sentry/core';
+import { makeFetchTransport } from '@sentry/react';
+
+import type { ReactNativeClientOptions } from '../src/js/options';
+import type { ReactNativeTracingIntegration } from '../src/js/tracing';
+
+import { getDevServer } from '../src/js/integrations/debugsymbolicatorutils';
+import { init, withScope } from '../src/js/sdk';
+import { REACT_NATIVE_TRACING_INTEGRATION_NAME, reactNativeTracingIntegration } from '../src/js/tracing';
+import { makeNativeTransport } from '../src/js/transports/native';
+import { getDefaultEnvironment, isExpoGo, isWeb, notWeb } from '../src/js/utils/environment';
+import { registerFeatureMarker } from '../src/js/utils/featureMarkers';
+import { RN_GLOBAL_OBJ } from '../src/js/utils/worldwide';
+import { NATIVE } from './mockWrapper';
+import { firstArg, secondArg } from './testutils';
+
+jest.spyOn(debug, 'error');
+jest.spyOn(debug, 'warn');
+jest.mock('../src/js/wrapper', () => jest.requireActual('./mockWrapper'));
+jest.mock('../src/js/utils/environment');
+jest.mock('@sentry/core', () => ({
+  ...jest.requireActual('@sentry/core'),
+  initAndBind: jest.fn(),
+}));
+jest.mock('../src/js/integrations/debugsymbolicatorutils', () => ({
+  getDevServer: jest.fn(),
+}));
+jest.mock('../src/js/utils/featureMarkers', () => ({
+  registerFeatureMarker: jest.fn(),
+}));
+
+describe('Tests the SDK functionality', () => {
+  beforeEach(() => {
+    (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => true);
+    (notWeb as jest.Mock).mockImplementation(() => true);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('init', () => {
+    describe('enableAutoPerformanceTracing', () => {
+      const reactNavigationInstrumentation = (): ReactNativeTracingIntegration => {
+        return reactNativeTracingIntegration();
+      };
+
+      it('Auto Performance is disabled by default', () => {
+        init({});
+
+        expect(autoPerformanceIsEnabled()).toBe(false);
+      });
+
+      it('Auto Performance is disabled when tracesSampleRate is set to undefined', () => {
+        init({
+          tracesSampleRate: undefined,
+        });
+
+        expect(autoPerformanceIsEnabled()).toBe(false);
+      });
+
+      it('Auto Performance is disabled when tracesSampler is set to undefined', () => {
+        init({
+          tracesSampler: undefined,
+        });
+
+        expect(autoPerformanceIsEnabled()).toBe(false);
+      });
+
+      it('Auto Performance is enabled when tracing is enabled (tracesSampler)', () => {
+        init({
+          tracesSampler: () => true,
+          enableAutoPerformanceTracing: true,
+        });
+
+        expect(autoPerformanceIsEnabled()).toBe(true);
+      });
+
+      it('Auto Performance is enabled when tracing is enabled (tracesSampleRate)', () => {
+        init({
+          tracesSampleRate: 0.5,
+          enableAutoPerformanceTracing: true,
+        });
+
+        expect(autoPerformanceIsEnabled()).toBe(true);
+      });
+
+      it('Do not overwrite user defined integrations when passing integrations', () => {
+        const tracing = reactNavigationInstrumentation();
+        init({
+          tracesSampleRate: 0.5,
+          enableAutoPerformanceTracing: true,
+          integrations: [tracing],
+        });
+
+        const options = usedIntegrations();
+        expect(options.filter(integration => integration.name === REACT_NATIVE_TRACING_INTEGRATION_NAME).length).toBe(
+          1,
+        );
+        expect(options.some(integration => integration === tracing)).toBe(true);
+      });
+
+      it('Do not overwrite user defined integrations when passing defaultIntegrations', () => {
+        const tracing = reactNavigationInstrumentation();
+        init({
+          tracesSampleRate: 0.5,
+          enableAutoPerformanceTracing: true,
+          defaultIntegrations: [tracing],
+        });
+
+        const options = usedIntegrations();
+        expect(options.filter(integration => integration.name === REACT_NATIVE_TRACING_INTEGRATION_NAME).length).toBe(
+          1,
+        );
+        expect(options.some(integration => integration === tracing)).toBe(true);
+      });
+    });
+
+    describe('initialization from sentry.options.json', () => {
+      it('initializes without __SENTRY_OPTIONS__', () => {
+        delete RN_GLOBAL_OBJ.__SENTRY_OPTIONS__;
+        init({});
+        expect(initAndBind).toHaveBeenCalledOnce();
+      });
+
+      it('adds options from __SENTRY_OPTIONS__', () => {
+        RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {
+          dsn: 'https://key@example.io/value',
+        };
+        init({});
+        expect(usedOptions()?.dsn).toBe('https://key@example.io/value');
+      });
+
+      it('options init override options from __SENTRY_OPTIONS__', () => {
+        RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {
+          dsn: 'https://key@example.io/file',
+        };
+        init({
+          dsn: 'https://key@example.io/code',
+        });
+        expect(usedOptions()?.dsn).toBe('https://key@example.io/code');
+      });
+
+      it('does not disable native auto initialization in dev builds even with __SENTRY_OPTIONS__', () => {
+        // @ts-expect-error __DEV__ is a global
+        const originalDev = globalThis.__DEV__;
+        // @ts-expect-error __DEV__ is a global
+        globalThis.__DEV__ = true;
+        try {
+          RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {};
+          init({});
+          expect(usedOptions()?.autoInitializeNativeSdk).toBe(true);
+        } finally {
+          // @ts-expect-error __DEV__ is a global
+          globalThis.__DEV__ = originalDev;
+        }
+      });
+
+      it('disables native auto initialization in release builds with __SENTRY_OPTIONS__', () => {
+        // @ts-expect-error __DEV__ is a global
+        const originalDev = globalThis.__DEV__;
+        // @ts-expect-error __DEV__ is a global
+        globalThis.__DEV__ = false;
+        try {
+          RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {};
+          init({});
+          expect(usedOptions()?.autoInitializeNativeSdk).toBe(false);
+        } finally {
+          // @ts-expect-error __DEV__ is a global
+          globalThis.__DEV__ = originalDev;
+        }
+      });
+
+      it('initializing without __SENTRY_OPTIONS__ enables native auto initialization', () => {
+        RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = undefined;
+        init({});
+        expect(usedOptions()?.autoInitializeNativeSdk).toBe(true);
+      });
+
+      it('initializing with __SENTRY_OPTIONS__ keeps native auto initialization true if set', () => {
+        RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {};
+        init({
+          autoInitializeNativeSdk: true,
+        });
+        expect(usedOptions()?.autoInitializeNativeSdk).toBe(true);
+      });
+
+      it('respects explicit autoInitializeNativeSdk false even with __SENTRY_OPTIONS__', () => {
+        RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {};
+        init({
+          autoInitializeNativeSdk: false,
+        });
+        expect(usedOptions()?.autoInitializeNativeSdk).toBe(false);
+      });
+
+      it('registers the CaptureAppStartErrors marker when __SENTRY_OPTIONS__ is set', () => {
+        RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {};
+        init({});
+        expect(registerFeatureMarker).toHaveBeenCalledWith('CaptureAppStartErrors');
+      });
+
+      it('does not register the CaptureAppStartErrors marker without __SENTRY_OPTIONS__', () => {
+        delete RN_GLOBAL_OBJ.__SENTRY_OPTIONS__;
+        init({});
+        expect(registerFeatureMarker).not.toHaveBeenCalledWith('CaptureAppStartErrors');
+      });
+    });
+
+    describe('environment', () => {
+      it('detect development environment', () => {
+        (getDefaultEnvironment as jest.Mock).mockImplementation(() => 'development');
+        init({
+          enableNative: true,
+        });
+        expect(usedOptions()?.environment).toBe('development');
+      });
+
+      it('uses custom environment', () => {
+        init({
+          environment: 'custom',
+        });
+        expect(usedOptions()?.environment).toBe('custom');
+      });
+
+      it('it keeps empty string environment', () => {
+        init({
+          environment: '',
+        });
+        expect(usedOptions()?.environment).toBe('');
+      });
+
+      it('it keeps undefined environment', () => {
+        init({
+          environment: undefined,
+        });
+        expect(usedOptions()?.environment).toBe(undefined);
+      });
+
+      it('uses environment from __SENTRY_OPTIONS__ instead of the default when not set in init', () => {
+        (getDefaultEnvironment as jest.Mock).mockImplementation(() => 'production');
+        RN_GLOBAL_OBJ.__SENTRY_OPTIONS__ = {
+          environment: 'staging',
+        };
+        try {
+          init({});
+          expect(usedOptions()?.environment).toBe('staging');
+        } finally {
+          delete RN_GLOBAL_OBJ.__SENTRY_OPTIONS__;
+        }
+      });
+    });
+
+    describe('release', () => {
+      afterEach(() => {
+        (notWeb as jest.Mock).mockReset();
+        RN_GLOBAL_OBJ.SENTRY_RELEASE = undefined;
+      });
+
+      it('uses release from global for web', () => {
+        RN_GLOBAL_OBJ.SENTRY_RELEASE = {
+          name: 'test',
+          version: '1.0.0',
+        };
+        (notWeb as jest.Mock).mockImplementation(() => false);
+        init({});
+        expect(usedOptions()?.release).toEqual('test@1.0.0');
+      });
+
+      it('uses release from options for web', () => {
+        RN_GLOBAL_OBJ.SENTRY_RELEASE = {
+          name: 'test',
+          version: '1.0.0',
+        };
+        (notWeb as jest.Mock).mockImplementation(() => false);
+        init({
+          release: 'custom@2.0.0',
+        });
+        expect(usedOptions()?.release).toEqual('custom@2.0.0');
+      });
+
+      it('uses undefined for others', () => {
+        RN_GLOBAL_OBJ.SENTRY_RELEASE = {
+          name: 'test',
+          version: '1.0.0',
+        };
+        (notWeb as jest.Mock).mockImplementation(() => true);
+        init({});
+        expect(usedOptions()?.release).toBeUndefined();
+      });
+    });
+
+    describe('transport options buffer size', () => {
+      it('uses default transport options buffer size', () => {
+        init({
+          tracesSampleRate: 0.5,
+          enableAutoPerformanceTracing: true,
+        });
+        expect(usedOptions()?.transportOptions?.bufferSize).toBe(30);
+      });
+
+      it('uses custom transport options buffer size', () => {
+        init({
+          transportOptions: {
+            bufferSize: 99,
+          },
+        });
+        expect(usedOptions()?.transportOptions?.bufferSize).toBe(99);
+      });
+
+      it('uses max queue size', () => {
+        init({
+          maxQueueSize: 88,
+        });
+        expect(usedOptions()?.transportOptions?.bufferSize).toBe(88);
+      });
+    });
+  });
+
+  describe('transport initialization', () => {
+    describe('native SDK unavailable', () => {
+      it('fetchTransport set and enableNative set to false', () => {
+        (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+        init({});
+        expect(NATIVE.isNativeAvailable).toHaveBeenCalled();
+        // @ts-expect-error enableNative not publicly available here.
+        expect(usedOptions()?.enableNative).toEqual(false);
+        expect(usedOptions()?.transport).toEqual(makeFetchTransport);
+      });
+
+      it('fetchTransport set and passed enableNative ignored when true', () => {
+        (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+        init({ enableNative: true });
+        expect(NATIVE.isNativeAvailable).toHaveBeenCalled();
+        // @ts-expect-error enableNative not publicly available here.
+        expect(usedOptions()?.enableNative).toEqual(false);
+        expect(usedOptions()?.transport).toEqual(makeFetchTransport);
+      });
+
+      it('fetchTransport set and isNativeAvailable not called when passed enableNative set to false', () => {
+        (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+        init({ enableNative: false });
+        expect(NATIVE.isNativeAvailable).not.toHaveBeenCalled();
+        // @ts-expect-error enableNative not publicly available here.
+        expect(usedOptions()?.enableNative).toEqual(false);
+        expect(usedOptions()?.transport).toEqual(makeFetchTransport);
+      });
+
+      it('custom transport set and enableNative set to false', () => {
+        (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+        const mockTransport = jest.fn();
+        init({
+          transport: mockTransport,
+        });
+        expect(usedOptions()?.transport).toEqual(mockTransport);
+        expect(NATIVE.isNativeAvailable).toHaveBeenCalled();
+        // @ts-expect-error enableNative not publicly available here.
+        expect(usedOptions()?.enableNative).toEqual(false);
+      });
+    });
+
+    it('uses transport from the options', () => {
+      const mockTransport = jest.fn();
+      init({
+        transport: mockTransport,
+      });
+      expect(usedOptions()?.transport).toEqual(mockTransport);
+    });
+
+    it('uses native transport', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => true);
+      init({});
+      expect(usedOptions()?.transport).toEqual(makeNativeTransport);
+    });
+
+    it('uses fallback fetch transport', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+      init({});
+      expect(usedOptions()?.transport).toEqual(makeFetchTransport);
+    });
+
+    it('checks sdk options first', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => true);
+      init({ enableNative: false });
+      expect(usedOptions()?.transport).toEqual(makeFetchTransport);
+      expect(NATIVE.isNativeAvailable).not.toHaveBeenCalled();
+    });
+
+    it('check both options and native availability', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => true);
+      init({ enableNative: true });
+      expect(usedOptions()?.transport).toEqual(makeNativeTransport);
+      expect(NATIVE.isNativeAvailable).toHaveBeenCalled();
+    });
+  });
+
+  describe('initIsSafe', () => {
+    test('initialScope callback is safe after init', () => {
+      const mockInitialScope = jest.fn(() => {
+        throw 'Test error';
+      });
+
+      init({ initialScope: mockInitialScope });
+
+      expect(() => {
+        (usedOptions()?.initialScope as (scope: Scope) => Scope)({} as any);
+      }).not.toThrow();
+      expect(mockInitialScope).toHaveBeenCalledTimes(1);
+    });
+    test('beforeBreadcrumb callback is safe after init and drops the breadcrumb on error', () => {
+      const mockBeforeBreadcrumb = jest.fn(() => {
+        throw 'Test error';
+      });
+
+      init({ beforeBreadcrumb: mockBeforeBreadcrumb });
+
+      let result: ReturnType<NonNullable<ReturnType<typeof usedOptions>>['beforeBreadcrumb']> | undefined;
+      expect(() => {
+        result = usedOptions()?.beforeBreadcrumb?.({ message: 'test' } as any);
+      }).not.toThrow();
+      expect(mockBeforeBreadcrumb).toHaveBeenCalledTimes(1);
+      // Per the Callback Error Isolation spec the breadcrumb is dropped (null) on error.
+      expect(result).toBeNull();
+    });
+
+    test('integrations callback should not crash init', () => {
+      const mockIntegrations = jest.fn(() => {
+        throw 'Test error';
+      });
+
+      expect(() => {
+        init({ integrations: mockIntegrations });
+      }).not.toThrow();
+      expect(mockIntegrations).toHaveBeenCalledTimes(1);
+    });
+
+    test('tracesSampler callback is safe after init and falls back to tracesSampleRate on error', () => {
+      const mockTraceSampler = jest.fn(() => {
+        throw 'Test error';
+      });
+
+      init({ tracesSampler: mockTraceSampler, tracesSampleRate: 0.42 });
+
+      let result: number | boolean | undefined;
+      expect(() => {
+        result = usedOptions()?.tracesSampler?.({} as any);
+      }).not.toThrow();
+      expect(mockTraceSampler).toHaveBeenCalledTimes(1);
+      // Per the Callback Error Isolation spec the sampler falls back to the configured
+      // tracesSampleRate rather than substituting a hardcoded 0.
+      expect(result).toBe(0.42);
+    });
+  });
+
+  describe('strictTraceContinuation', () => {
+    it('passes strictTraceContinuation option through to client options', () => {
+      init({
+        strictTraceContinuation: true,
+      });
+      expect(usedOptions()?.strictTraceContinuation).toBe(true);
+    });
+
+    it('passes orgId option through to client options', () => {
+      init({
+        orgId: '12345',
+      });
+      expect(usedOptions()?.orgId).toBe('12345');
+    });
+
+    it('passes numeric orgId option through to client options', () => {
+      init({
+        orgId: 12345,
+      });
+      expect(usedOptions()?.orgId).toBe(12345);
+    });
+
+    it('defaults strictTraceContinuation to undefined when not set', () => {
+      init({});
+      expect(usedOptions()?.strictTraceContinuation).toBeUndefined();
+    });
+  });
+
+  describe('beforeBreadcrumb', () => {
+    it('should filters out dev server breadcrumbs', () => {
+      const devServerUrl = 'http://localhost:8081';
+      (getDevServer as jest.Mock).mockReturnValue({ url: devServerUrl });
+
+      const mockBeforeBreadcrumb = (breadcrumb: Breadcrumb, _hint?: BreadcrumbHint) => {
+        return breadcrumb;
+      };
+
+      const passedOptions = {
+        dsn: 'https://example@sentry.io/123',
+        beforeBreadcrumb: mockBeforeBreadcrumb,
+      };
+
+      init(passedOptions);
+
+      const breadcrumb: Breadcrumb = {
+        type: 'http',
+        data: { url: devServerUrl },
+      };
+
+      const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+      expect(result).toBeNull();
+    });
+
+    it('should filter out dsn breadcrumbs', () => {
+      (getDevServer as jest.Mock).mockReturnValue({ url: 'http://localhost:8081' });
+
+      const mockBeforeBreadcrumb = (breadcrumb: Breadcrumb, _hint?: BreadcrumbHint) => {
+        return breadcrumb;
+      };
+
+      const passedOptions = {
+        dsn: 'https://abc@def.ingest.sentry.io/1234567',
+        beforeBreadcrumb: mockBeforeBreadcrumb,
+      };
+
+      init(passedOptions);
+
+      const breadcrumb: Breadcrumb = {
+        type: 'http',
+        data: { url: 'https://def.ingest.sentry.io/1234567' },
+      };
+
+      const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+      expect(result).toBeNull();
+    });
+
+    it('should filter out dsn breadcrumbs that the ports match', () => {
+      (getDevServer as jest.Mock).mockReturnValue({ url: 'http://localhost:8081' });
+
+      const mockBeforeBreadcrumb = (breadcrumb: Breadcrumb, _hint?: BreadcrumbHint) => {
+        return breadcrumb;
+      };
+
+      const passedOptions = {
+        dsn: 'https://sentry@selfhosted.app.server:8181/1234567',
+        beforeBreadcrumb: mockBeforeBreadcrumb,
+      };
+
+      init(passedOptions);
+
+      const breadcrumb: Breadcrumb = {
+        type: 'http',
+        data: { url: 'https://selfhosted.app.server:8181/api' },
+      };
+
+      const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+      expect(result).toBeNull();
+    });
+
+    it('should keep breadcrumbs if the ports do not match', () => {
+      (getDevServer as jest.Mock).mockReturnValue({ url: 'http://localhost:8081' });
+
+      const mockBeforeBreadcrumb = (breadcrumb: Breadcrumb, _hint?: BreadcrumbHint) => {
+        return breadcrumb;
+      };
+
+      const passedOptions = {
+        dsn: 'https://sentry@selfhosted.app.server:8181/1234567',
+        beforeBreadcrumb: mockBeforeBreadcrumb,
+      };
+
+      init(passedOptions);
+
+      const breadcrumb: Breadcrumb = {
+        type: 'http',
+        data: { url: 'https://selfhosted.app.server:8080/api' },
+      };
+
+      const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+      expect(result).toEqual(breadcrumb);
+    });
+
+    it('should keep breadcrumbs if the url parsing fails for dsn', () => {
+      (getDevServer as jest.Mock).mockReturnValue({ url: 'http://localhost:8081' });
+
+      const mockBeforeBreadcrumb = (breadcrumb: Breadcrumb, _hint?: BreadcrumbHint) => {
+        return breadcrumb;
+      };
+
+      const passedOptions = {
+        dsn: 'invalid-dsn',
+        beforeBreadcrumb: mockBeforeBreadcrumb,
+      };
+
+      init(passedOptions);
+
+      const breadcrumb: Breadcrumb = {
+        type: 'http',
+        data: { url: 'https://def.ingest.sentry.io/1234567' },
+      };
+
+      const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+      expect(result).toEqual(breadcrumb);
+    });
+
+    it('should keep non dev server or dsn breadcrumbs', () => {
+      (getDevServer as jest.Mock).mockReturnValue({ url: 'http://localhost:8081' });
+
+      const mockBeforeBreadcrumb = (breadcrumb: Breadcrumb, _hint?: BreadcrumbHint) => {
+        return breadcrumb;
+      };
+
+      const passedOptions = {
+        dsn: 'https://example@sentry.io/123',
+        beforeBreadcrumb: mockBeforeBreadcrumb,
+      };
+
+      init(passedOptions);
+
+      const breadcrumb: Breadcrumb = {
+        type: 'http',
+        data: { url: 'http://testurl.com/service' },
+      };
+
+      const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+      expect(result).toEqual(breadcrumb);
+    });
+
+    it('verify the user beforeBreadcrumb is chained', () => {
+      const devServerUrl = 'http://localhost:8081';
+
+      (getDevServer as jest.Mock).mockReturnValue({ url: devServerUrl });
+
+      const mockBeforeBreadcrumb = (breadcrumb: Breadcrumb, _hint?: BreadcrumbHint) => {
+        breadcrumb.data = { url: devServerUrl }; // Set to an excluded url
+        return breadcrumb;
+      };
+
+      const passedOptions = {
+        dsn: 'https://example@sentry.io/123',
+        beforeBreadcrumb: mockBeforeBreadcrumb,
+      };
+
+      init(passedOptions);
+
+      const breadcrumb: Breadcrumb = {
+        type: 'http',
+        data: { url: 'http://testurl.com/service' }, // Not an excluded url
+      };
+
+      const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+      expect(result).toBeNull();
+    });
+  });
+
+  it('should keep the breadcrumb when the dev server and dsn are undefined', () => {
+    (getDevServer as jest.Mock).mockReturnValue({ url: undefined });
+
+    init({});
+
+    const breadcrumb: Breadcrumb = {
+      type: 'http',
+      data: { url: 'http://testurl.com/service' },
+    };
+
+    const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+    expect(result).toEqual(breadcrumb);
+  });
+
+  it('should keep the breadcrumb when the dev server does not match and the dsn is undefined', () => {
+    (getDevServer as jest.Mock).mockReturnValue({ url: 'http://localhost:8081' });
+
+    init({});
+
+    const breadcrumb: Breadcrumb = {
+      type: 'http',
+      data: { url: 'http://testurl.com/service' },
+    };
+
+    const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+    expect(result).toEqual(breadcrumb);
+  });
+
+  it('should keep the breadcrumb when the dev server is undefined and the dsn does not match', () => {
+    (getDevServer as jest.Mock).mockReturnValue({ url: undefined });
+
+    init({ dsn: 'https://example@sentry.io/123' });
+
+    const breadcrumb: Breadcrumb = {
+      type: 'http',
+      data: { url: 'http://testurl.com/service' },
+    };
+
+    const result = usedOptions()?.beforeBreadcrumb!(breadcrumb);
+
+    expect(result).toEqual(breadcrumb);
+  });
+
+  describe('withScope', () => {
+    test('withScope callback does not throw', () => {
+      const mockScopeCallback = jest.fn(() => {
+        throw 'Test error';
+      });
+
+      expect(() => withScope(mockScopeCallback)).not.toThrow();
+      expect(mockScopeCallback).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('integrations', () => {
+    it('replaces default integrations', () => {
+      const mockDefaultIntegration = createMockedIntegration();
+      init({
+        defaultIntegrations: [mockDefaultIntegration],
+      });
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+
+      expect(actualIntegrations).toEqual([mockDefaultIntegration]);
+    });
+
+    it('no http client integration by default', () => {
+      init({});
+
+      expectNotIntegration('HttpClient');
+    });
+
+    it('adds http client integration', () => {
+      init({
+        enableCaptureFailedRequests: true,
+      });
+
+      expectIntegration('HttpClient');
+    });
+
+    it('user defined http client integration overwrites default', () => {
+      init({
+        enableCaptureFailedRequests: true,
+        integrations: [
+          <Integration>{
+            name: 'HttpClient',
+            setupOnce: () => {},
+            isUserDefined: true,
+          },
+        ],
+      });
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+
+      expect(actualIntegrations).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'HttpClient',
+            isUserDefined: true,
+          }),
+        ]),
+      );
+      expect(actualIntegrations?.filter(integration => integration.name === 'HttpClient')).toHaveLength(1);
+    });
+
+    it('no screenshot integration by default', () => {
+      init({});
+
+      expectNotIntegration('Screenshot');
+    });
+
+    it('adds screenshot integration', () => {
+      init({
+        attachScreenshot: true,
+      });
+
+      expectIntegration('Screenshot');
+    });
+
+    it('no view hierarchy integration by default', () => {
+      init({});
+
+      expectNotIntegration('ViewHierarchy');
+    });
+
+    it('adds view hierarchy integration', () => {
+      init({
+        attachViewHierarchy: true,
+      });
+
+      expectIntegration('ViewHierarchy');
+    });
+
+    it('no profiling integration by default', () => {
+      init({});
+
+      expectNotIntegration('HermesProfiling');
+    });
+
+    it('adds profiling integration', () => {
+      init({
+        profilesSampleRate: 0.7,
+      });
+
+      expectIntegration('HermesProfiling');
+    });
+
+    it('adds browserSessionIntegration on web when enableAutoSessionTracking is set true', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+      (notWeb as jest.Mock).mockImplementation(() => false);
+      init({ enableAutoSessionTracking: true });
+
+      expectIntegration('BrowserSession');
+    });
+
+    it('no browserSessionIntegration on web when enableAutoSessionTracking is set false', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+      (notWeb as jest.Mock).mockImplementation(() => false);
+      init({ enableAutoSessionTracking: false });
+
+      expectNotIntegration('BrowserSession');
+    });
+
+    it('no browserSessionIntegration on web when enableAutoSessionTracking is not set', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+      (notWeb as jest.Mock).mockImplementation(() => false);
+      init({});
+
+      expectNotIntegration('BrowserSession');
+    });
+
+    it('no browserSessionIntegration on mobile', () => {
+      init({ enableAutoSessionTracking: true });
+
+      expectNotIntegration('BrowserSession');
+    });
+
+    it('no spotlight integration by default', () => {
+      init({});
+
+      expectNotIntegration('Spotlight');
+    });
+
+    it('no app start integration by default', () => {
+      init({});
+
+      expectNotIntegration('AppStart');
+    });
+
+    it('when tracing enabled app start integration added by default', () => {
+      init({
+        tracesSampleRate: 0.5,
+      });
+
+      expectIntegration('AppStart');
+    });
+
+    it('when tracing enabled and app start disabled the integration is not added', () => {
+      init({
+        tracesSampleRate: 0.5,
+        enableAppStartTracking: false,
+      });
+
+      expectNotIntegration('AppStart');
+    });
+
+    it('when tracing enabled app start without native (on web, Expo Go) integration is not added', () => {
+      init({
+        tracesSampleRate: 0.5,
+        enableNative: false,
+      });
+
+      expectNotIntegration('AppStart');
+    });
+
+    it('no native frames integration by default', () => {
+      init({});
+
+      expectNotIntegration('NativeFrames');
+    });
+
+    it('when tracing enabled native frames integration added by default', () => {
+      init({
+        tracesSampleRate: 0.5,
+      });
+
+      expectIntegration('NativeFrames');
+    });
+
+    it('when tracing enabled and native frames disabled the integration is not added', () => {
+      init({
+        tracesSampleRate: 0.5,
+        enableNativeFramesTracking: false,
+      });
+
+      expectNotIntegration('NativeFrames');
+    });
+
+    it('when tracing enabled (on web, Expo Go) native frames integration is not added', () => {
+      init({
+        tracesSampleRate: 0.5,
+        enableNative: false,
+      });
+
+      expectNotIntegration('NativeFrames');
+    });
+
+    it('when tracing not set stall tracking the integration is not added', () => {
+      init({});
+
+      expectNotIntegration('StallTracking');
+    });
+
+    it('when tracing enabled stall tracking integration added by default', () => {
+      init({
+        tracesSampleRate: 0.5,
+      });
+
+      expectIntegration('StallTracking');
+    });
+
+    it('when tracing enabled and stall tracking disabled the integration is not added', () => {
+      init({
+        tracesSampleRate: 0.5,
+        enableStallTracking: false,
+      });
+
+      expectNotIntegration('StallTracking');
+    });
+
+    describe('user interaction integration', () => {
+      test('no integration when tracing disabled', () => {
+        init({});
+
+        expectNotIntegration('UserInteraction');
+      });
+      test('no integration when tracing enabled', () => {
+        init({
+          tracesSampleRate: 0.5,
+        });
+
+        expectNotIntegration('UserInteraction');
+      });
+
+      test('no integration when tracing enabled but user interaction explicitly disabled', () => {
+        init({
+          tracesSampleRate: 0.5,
+          enableUserInteractionTracing: false,
+        });
+
+        expectNotIntegration('UserInteraction');
+      });
+
+      test('integration added when tracing enabled and user interaction enabled', () => {
+        init({
+          tracesSampleRate: 0.5,
+          enableUserInteractionTracing: true,
+        });
+
+        expectIntegration('UserInteraction');
+      });
+    });
+
+    describe('app registry integration', () => {
+      test('no integration when tracing disabled', () => {
+        init({});
+
+        expectNotIntegration('AppRegistry');
+      });
+      test('integration added when tracing enabled', () => {
+        init({
+          tracesSampleRate: 0.5,
+        });
+
+        expectIntegration('AppRegistry');
+      });
+    });
+
+    describe('time to display integration', () => {
+      it('no integration when tracing disabled', () => {
+        init({});
+
+        expectNotIntegration('TimeToDisplay');
+      });
+
+      it('integration added when tracing enabled', () => {
+        init({
+          tracesSampleRate: 0.5,
+        });
+
+        expectIntegration('TimeToDisplay');
+      });
+    });
+
+    it('adds spotlight integration with spotlight bool', () => {
+      init({
+        spotlight: true,
+      });
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+      expect(actualIntegrations).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'Spotlight' })]));
+    });
+
+    it('adds spotlight integration with direct url', () => {
+      init({
+        spotlight: 'http://localhost:8969/stream',
+      });
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+      expect(actualIntegrations).toEqual(expect.arrayContaining([expect.objectContaining({ name: 'Spotlight' })]));
+    });
+
+    it('no default integrations', () => {
+      init({
+        defaultIntegrations: false,
+      });
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+
+      expect(actualIntegrations).toEqual([]);
+    });
+
+    it('merges with passed default integrations', () => {
+      const mockIntegration = createMockedIntegration();
+      const mockDefaultIntegration = createMockedIntegration({ name: 'MockedDefaultIntegration' });
+      init({
+        integrations: [mockIntegration],
+        defaultIntegrations: [mockDefaultIntegration],
+      });
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+
+      expect(actualIntegrations).toEqual(expect.arrayContaining([mockIntegration, mockDefaultIntegration])); // order doesn't matter
+      expect(actualIntegrations?.length).toBe(2); // there should be no extra unexpected integrations
+    });
+
+    it('merges with default integrations', () => {
+      const mockIntegration = createMockedIntegration();
+      init({
+        integrations: [mockIntegration],
+      });
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+
+      expect(actualIntegrations).toEqual(expect.arrayContaining([mockIntegration]));
+      expect(actualIntegrations?.length).toBeGreaterThan(1); // there should be default integrations + the test one
+    });
+
+    it('passes default integrations to the function', () => {
+      const mockIntegration = createMockedIntegration();
+      const mockIntegrationFactory = jest.fn((_integrations: Integration[]) => [mockIntegration]);
+      init({
+        integrations: mockIntegrationFactory,
+      });
+
+      const actualPassedIntegrations = mockIntegrationFactory.mock.calls[0][firstArg];
+
+      expect(actualPassedIntegrations.length).toBeGreaterThan(0);
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+
+      expect(actualIntegrations).toEqual([mockIntegration]);
+    });
+
+    it('passes custom default integrations to the function', () => {
+      const mockIntegration = createMockedIntegration();
+      const mockDefaultIntegration = createMockedIntegration({ name: 'MockedDefaultIntegration' });
+      const mockIntegrationFactory = jest.fn((_integrations: Integration[]) => [mockIntegration]);
+      init({
+        integrations: mockIntegrationFactory,
+        defaultIntegrations: [mockDefaultIntegration],
+      });
+
+      const actualPassedIntegrations = mockIntegrationFactory.mock.calls[0][firstArg];
+
+      expect(actualPassedIntegrations).toEqual([mockDefaultIntegration]);
+
+      const actualOptions = usedOptions();
+      const actualIntegrations = actualOptions?.integrations;
+
+      expect(actualIntegrations).toEqual([mockIntegration]);
+    });
+
+    it('passes no defaults to the function', () => {
+      const mockIntegrationFactory = jest.fn((_integrations: Integration[]) => []);
+      init({
+        integrations: mockIntegrationFactory,
+        defaultIntegrations: false,
+      });
+
+      const actualPassedIntegrations = mockIntegrationFactory.mock.calls[0][firstArg];
+
+      expect(actualPassedIntegrations).toEqual([]);
+    });
+
+    it('adds react default integrations', () => {
+      init({});
+
+      expectIntegration('InboundFilters');
+      expectIntegration('FunctionToString');
+      expectIntegration('Breadcrumbs');
+      expectIntegration('Dedupe');
+      expectIntegration('HttpContext');
+    });
+
+    it('adds all platform default integrations', () => {
+      init({});
+
+      expectIntegration('Release');
+      expectIntegration('EventOrigin');
+      expectIntegration('SdkInfo');
+      expectIntegration('ReactNativeInfo');
+      expectIntegration('ExpoContext');
+    });
+
+    it('adds web platform specific default integrations', () => {
+      (notWeb as jest.Mock).mockImplementation(() => false);
+      init({});
+
+      expectIntegration('BrowserApiErrors');
+      expectIntegration('GlobalHandlers');
+      expectIntegration('LinkedErrors');
+    });
+
+    it('does not add native integrations if native disabled', () => {
+      (NATIVE.isNativeAvailable as jest.Mock).mockImplementation(() => false);
+      init({
+        attachScreenshot: true,
+        attachViewHierarchy: true,
+        profilesSampleRate: 0.7,
+      });
+
+      expectNotIntegration('DeviceContext');
+      expectNotIntegration('ModulesLoader');
+      expectNotIntegration('Screenshot');
+      expectNotIntegration('ViewHierarchy');
+      expectNotIntegration('HermesProfiling');
+    });
+  });
+
+  it('adds expo context integration if expo go is detected', () => {
+    (isExpoGo as jest.Mock).mockImplementation(() => true);
+    init({});
+
+    expectIntegration('ExpoContext');
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('adds mobile replay integration when _experiments.replaysOnErrorSampleRate is set', () => {
+    init({
+      _experiments: {
+        replaysOnErrorSampleRate: 1.0,
+      },
+    });
+
+    expectIntegration('MobileReplay');
+  });
+
+  it('adds mobile replay integration when replaysOnErrorSampleRate is set', () => {
+    init({
+      replaysOnErrorSampleRate: 1.0,
+    });
+
+    expectIntegration('MobileReplay');
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('adds mobile replay integration when _experiments.replaysSessionSampleRate is set', () => {
+    init({
+      _experiments: {
+        replaysSessionSampleRate: 1.0,
+      },
+    });
+
+    expectIntegration('MobileReplay');
+  });
+
+  it('adds mobile replay integration when replaysSessionSampleRate is set', () => {
+    init({
+      replaysSessionSampleRate: 1.0,
+    });
+
+    expectIntegration('MobileReplay');
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('does not add mobile replay integration when no replay sample rates are set', () => {
+    init({
+      _experiments: {},
+    });
+
+    expectNotIntegration('MobileReplay');
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('does not add any replay integration when on web even with on experimental error sample rate', () => {
+    (notWeb as jest.Mock).mockImplementation(() => false);
+    init({
+      _experiments: {
+        replaysOnErrorSampleRate: 1.0,
+      },
+    });
+
+    expectNotIntegration('Replay');
+    expectNotIntegration('MobileReplay');
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('does not add any replay integration when on web even with experimental session sample rate', () => {
+    (notWeb as jest.Mock).mockImplementation(() => false);
+    init({
+      _experiments: {
+        replaysSessionSampleRate: 1.0,
+      },
+    });
+
+    expectNotIntegration('Replay');
+    expectNotIntegration('MobileReplay');
+  });
+
+  it('does not add any replay integration when on web even with on error sample rate', () => {
+    (notWeb as jest.Mock).mockImplementation(() => false);
+    init({
+      replaysOnErrorSampleRate: 1.0,
+    });
+
+    expectNotIntegration('Replay');
+    expectNotIntegration('MobileReplay');
+  });
+
+  it('does not add any replay integration when on web even with session sample rate', () => {
+    (notWeb as jest.Mock).mockImplementation(() => false);
+    init({
+      replaysSessionSampleRate: 1.0,
+    });
+
+    expectNotIntegration('Replay');
+    expectNotIntegration('MobileReplay');
+  });
+
+  it('does not add any replay integration when on web', () => {
+    (notWeb as jest.Mock).mockImplementation(() => false);
+    init({});
+
+    expectNotIntegration('Replay');
+    expectNotIntegration('MobileReplay');
+  });
+
+  describe('replay integration missing warning', () => {
+    // Phrase unique to the missing-integration warning, so assertions don't collide with
+    // other replay warnings (e.g. the Expo Go / unsupported-platform noop warnings).
+    const MISSING_WARNING = 'integration is missing';
+
+    beforeEach(() => {
+      // Isolate from mock implementations leaked by earlier tests (isExpoGo/isWeb are not reset in the outer beforeEach).
+      (isExpoGo as jest.Mock).mockImplementation(() => false);
+      (isWeb as jest.Mock).mockImplementation(() => false);
+    });
+
+    it('warns when replay sample rates are set but the mobile replay integration is missing', () => {
+      init({
+        replaysSessionSampleRate: 1.0,
+        // Supplying defaultIntegrations skips the auto-add of mobileReplayIntegration
+        defaultIntegrations: [],
+      });
+
+      expectNotIntegration('MobileReplay');
+      expect(debug.warn).toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+      expect(debug.warn).toHaveBeenCalledWith(expect.stringContaining('mobileReplayIntegration()'));
+    });
+
+    it('warns when only replaysOnErrorSampleRate is set but the mobile replay integration is missing', () => {
+      init({
+        replaysOnErrorSampleRate: 1.0,
+        defaultIntegrations: [],
+      });
+
+      expect(debug.warn).toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+    });
+
+    it('warns when experimental replay sample rates are set but the mobile replay integration is missing', () => {
+      init({
+        _experiments: {
+          replaysSessionSampleRate: 1.0,
+        },
+        defaultIntegrations: [],
+      });
+
+      expect(debug.warn).toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+    });
+
+    it('does not warn when the mobile replay integration is auto-added', () => {
+      init({
+        replaysSessionSampleRate: 1.0,
+      });
+
+      expectIntegration('MobileReplay');
+      expect(debug.warn).not.toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+    });
+
+    it('does not warn when no replay sample rates are set', () => {
+      init({
+        defaultIntegrations: [],
+      });
+
+      expect(debug.warn).not.toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+    });
+
+    it('does not warn when replay sample rates are set to 0 (replay disabled)', () => {
+      init({
+        replaysSessionSampleRate: 0,
+        replaysOnErrorSampleRate: 0,
+        defaultIntegrations: [],
+      });
+
+      expect(debug.warn).not.toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+    });
+
+    it('warns when only replaysOnErrorSampleRate is greater than 0 and the integration is missing', () => {
+      init({
+        replaysSessionSampleRate: 0,
+        replaysOnErrorSampleRate: 1.0,
+        defaultIntegrations: [],
+      });
+
+      expect(debug.warn).toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+    });
+
+    it('warns with the browser integration hint when on web and the browser replay integration is missing', () => {
+      (notWeb as jest.Mock).mockImplementation(() => false);
+      (isWeb as jest.Mock).mockImplementation(() => true);
+      init({
+        replaysSessionSampleRate: 1.0,
+      });
+
+      expect(debug.warn).toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+      expect(debug.warn).toHaveBeenCalledWith(expect.stringContaining('browserReplayIntegration()'));
+    });
+
+    it('does not warn when on web and the browser replay integration is present', () => {
+      (notWeb as jest.Mock).mockImplementation(() => false);
+      (isWeb as jest.Mock).mockImplementation(() => true);
+      init({
+        replaysSessionSampleRate: 1.0,
+        integrations: [createMockedIntegration({ name: 'Replay' })],
+      });
+
+      expect(debug.warn).not.toHaveBeenCalledWith(expect.stringContaining(MISSING_WARNING));
+    });
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('ignores experimental replay options when ga options are set', () => {
+    (notWeb as jest.Mock).mockImplementation(() => false);
+    init({
+      replaysOnErrorSampleRate: 0.1,
+      replaysSessionSampleRate: 0.2,
+      _experiments: {
+        replaysOnErrorSampleRate: 0.3,
+        replaysSessionSampleRate: 0.4,
+      },
+    });
+
+    const actualOptions = usedOptions();
+    expect(actualOptions).toEqual(
+      expect.objectContaining({
+        replaysOnErrorSampleRate: 0.1,
+        replaysSessionSampleRate: 0.2,
+      }),
+    );
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('converts experimental replay options to standard web options when on web', () => {
+    (notWeb as jest.Mock).mockImplementation(() => false);
+    init({
+      _experiments: {
+        replaysOnErrorSampleRate: 0.5,
+        replaysSessionSampleRate: 0.1,
+      },
+    });
+
+    const actualOptions = usedOptions();
+    expect(actualOptions).toEqual(
+      expect.objectContaining({
+        replaysOnErrorSampleRate: 0.5,
+        replaysSessionSampleRate: 0.1,
+      }),
+    );
+  });
+
+  // TODO: No longer an experiment on major version.
+  it('converts experimental replay options to standard web options when on mobile', () => {
+    (notWeb as jest.Mock).mockImplementation(() => true);
+    init({
+      _experiments: {
+        replaysOnErrorSampleRate: 0.5,
+        replaysSessionSampleRate: 0.1,
+      },
+    });
+
+    const actualOptions = usedOptions();
+    expect(actualOptions).toEqual(
+      expect.objectContaining({
+        replaysOnErrorSampleRate: 0.5,
+        replaysSessionSampleRate: 0.1,
+      }),
+    );
+  });
+
+  it('propagateTraceparent is false by default', () => {
+    init({});
+
+    const actualOptions = usedOptions();
+    expect(actualOptions).toEqual(
+      expect.objectContaining({
+        propagateTraceparent: false,
+      }),
+    );
+  });
+
+  it('propagateTraceparent is getting passed to the client', () => {
+    init({ propagateTraceparent: true });
+
+    const actualOptions = usedOptions();
+    expect(actualOptions).toEqual(
+      expect.objectContaining({
+        propagateTraceparent: true,
+      }),
+    );
+  });
+});
+
+function expectIntegration(name: string): void {
+  const actualOptions = usedOptions();
+  const actualIntegrations = actualOptions?.integrations;
+  expect(actualIntegrations).toEqual(expect.arrayContaining([expect.objectContaining({ name })]));
+}
+
+function expectNotIntegration(name: string): void {
+  const actualOptions = usedOptions();
+  const actualIntegrations = actualOptions?.integrations;
+  expect(actualIntegrations).toEqual(expect.not.arrayContaining([expect.objectContaining({ name })]));
+}
+
+function createMockedIntegration({ name }: { name?: string } = {}): Integration {
+  return {
+    name: name ?? 'MockedIntegration',
+    setupOnce: jest.fn(),
+  };
+}
+
+function usedOptions(): ReactNativeClientOptions | undefined {
+  return (initAndBind as jest.MockedFunction<typeof initAndBind>).mock.calls[0]?.[secondArg];
+}
+
+function usedIntegrations(): Integration[] {
+  return usedOptions()?.integrations ?? [];
+}
+
+function autoPerformanceIsEnabled(): boolean {
+  return usedIntegrations().some(integration => integration.name === REACT_NATIVE_TRACING_INTEGRATION_NAME);
+}

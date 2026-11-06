@@ -1,0 +1,35 @@
+## :loudspeaker: Type of change
+<!--- Put an `x` in the boxes that apply -->
+- [ ] Bugfix
+- [ ] New feature
+- [ ] Enhancement
+- [ ] Refactoring
+
+
+## :scroll: Description
+<!--- Describe your changes in detail and optionally add screenshots -->
+
+
+## :bulb: Motivation and Context
+<!--- Why is this change required? What problem does it solve? -->
+<!--- If it fixes an open issue, please link to the issue here. -->
+
+
+## :green_heart: How did you test it?
+<!---
+Include a link to Sentry when applicable:
+* Link to Sentry: <LINK>
+-->
+
+
+## :pencil: Checklist
+<!--- Put an `x` in the boxes that apply -->
+- [ ] I added tests to verify changes.
+- [ ] No new PII added or SDK only sends newly added PII if `sendDefaultPII` is enabled.
+- [ ] I updated the docs if needed.
+- [ ] I updated the wizard if needed.
+- [ ] All tests passing.
+- [ ] Public API changes reviewed by another Mobile SDK team member or implemented according to the [develop docs](https://develop.sentry.dev/) spec.
+- [ ] No breaking changes.
+
+## :crystal_ball: Next steps

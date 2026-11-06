@@ -1,0 +1,250 @@
+import type { MetroConfig, MixedOutput, Module, ReadOnlyGraph, SerializerOptions } from 'metro';
+import type CountingSet from 'metro/src/lib/CountingSet'; // types are in src but exports are in private
+
+import * as crypto from 'crypto';
+
+import countLines from './vendor/metro/countLines';
+
+export type MetroCustomSerializer = Required<Required<MetroConfig>['serializer']>['customSerializer'] | undefined;
+
+// Variant of MixedOutput
+// https://github.com/facebook/metro/blob/9b85f83c9cc837d8cd897aa7723be7da5b296067/packages/metro/src/DeltaBundler/types.flow.js#L21
+export type VirtualJSOutput = {
+  type: 'js/script/virtual';
+  data: {
+    code: string;
+    lineCount: number;
+    map: [];
+  };
+};
+
+export type Bundle = {
+  modules: Array<[id: number, code: string]>;
+  post: string;
+  pre: string;
+};
+
+export type SentryMetroSerializerOptionsExtras = {
+  sentryBundleCallback?: (bundle: Bundle) => Bundle;
+};
+
+export type SerializedBundle = { code: string; map: string };
+
+export type MetroSerializerOutput = string | SerializedBundle | Promise<string | SerializedBundle>;
+
+export type MetroSerializer = (
+  entryPoint: string,
+  preModules: ReadonlyArray<Module>,
+  graph: ReadOnlyGraph,
+  options: SerializerOptions & SentryMetroSerializerOptionsExtras,
+) => MetroSerializerOutput;
+
+/**
+ * Returns minified Debug ID code snippet.
+ */
+export function createDebugIdSnippet(debugId: string): string {
+  return `var _sentryDebugIds,_sentryDebugIdIdentifier;void 0===_sentryDebugIds&&(_sentryDebugIds={});try{var stack=(new Error).stack;stack&&(_sentryDebugIds[stack]="${debugId}",_sentryDebugIdIdentifier="sentry-dbid-${debugId}")}catch(e){}`;
+}
+
+/**
+ * Returns the module metadata code snippet of `@sentry/bundler-plugins`.
+ *
+ * https://github.com/getsentry/sentry-javascript-bundler-plugins/blob/main/packages/bundler-plugin-core/src/utils.ts
+ */
+export function createModuleMetadataSnippet(metadata: Record<string, unknown>): string {
+  return `!function(){try{var e="undefined"!=typeof globalThis?globalThis:"undefined"!=typeof window?window:"undefined"!=typeof global?global:"undefined"!=typeof self?self:{};e._sentryModuleMetadata=e._sentryModuleMetadata||{},e._sentryModuleMetadata[(new e.Error).stack]=function(e){for(var n=1;n<arguments.length;n++){var a=arguments[n];if(null!=a)for(var t in a)a.hasOwnProperty(t)&&(e[t]=a[t])}return e}({},e._sentryModuleMetadata[(new e.Error).stack],${escapeUnsafeChars(
+    JSON.stringify(metadata),
+  )});}catch(e){}}();`;
+}
+
+const UNSAFE_CHARS: Record<string, string> = {
+  '<': '\\u003C',
+  '>': '\\u003E',
+  '\b': '\\b',
+  '\f': '\\f',
+  '\n': '\\n',
+  '\r': '\\r',
+  '\t': '\\t',
+  '\0': '\\0',
+  '\u2028': '\\u2028',
+  '\u2029': '\\u2029',
+};
+
+function escapeUnsafeChars(json: string): string {
+  return json.replace(/[<>\b\f\n\r\t\0\u2028\u2029]/g, char => UNSAFE_CHARS[char] ?? char);
+}
+
+/**
+ * Builds the module metadata in the same way as `@sentry/bundler-plugins`.
+ * Returns `undefined` if there is no metadata to inject.
+ */
+export function buildModuleMetadata({
+  applicationKey,
+  moduleMetadata,
+}: {
+  applicationKey?: string;
+  moduleMetadata?: Record<string, unknown>;
+}): Record<string, unknown> | undefined {
+  const metadata: Record<string, unknown> = {
+    ...(applicationKey ? { [`_sentryBundlerPluginAppKey:${applicationKey}`]: true } : {}),
+    ...moduleMetadata,
+  };
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+/**
+ * Deterministically hashes a string and turns the hash into a uuid.
+ *
+ * https://github.com/getsentry/sentry-javascript-bundler-plugins/blob/58271f1af2ade6b3e64d393d70376ae53bc5bd2f/packages/bundler-plugin-core/src/utils.ts#L174
+ */
+export function stringToUUID(str: string): string {
+  const md5sum = crypto.createHash('md5');
+  md5sum.update(str);
+  const md5Hash = md5sum.digest('hex');
+
+  // Position 16 is fixed to either 8, 9, a, or b in the uuid v4 spec (10xx in binary)
+  // RFC 4122 section 4.4
+  const v4variant = ['8', '9', 'a', 'b'][md5Hash.substring(16, 17).charCodeAt(0) % 4] as string;
+
+  return `${md5Hash.substring(0, 8)}-${md5Hash.substring(8, 12)}-4${md5Hash.substring(
+    13,
+    16,
+  )}-${v4variant}${md5Hash.substring(17, 20)}-${md5Hash.substring(20)}`.toLowerCase();
+}
+
+/**
+ * Looks for a particular string pattern (`sdbid-[debug ID]`) in the bundle
+ * source and extracts the bundle's debug ID from it.
+ *
+ * The string pattern is injected via the debug ID injection snipped.
+ *
+ * https://github.com/getsentry/sentry-javascript-bundler-plugins/blob/40f918458ed449d8b3eabaf64d13c08218213f65/packages/bundler-plugin-core/src/debug-id-upload.ts#L293-L294
+ */
+export function determineDebugIdFromBundleSource(code: string): string | undefined {
+  const match = code.match(
+    /sentry-dbid-([0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{4}\b-[0-9a-fA-F]{12})/,
+  );
+  return match ? match[1] : undefined;
+}
+
+/**
+ * CountingSet was added in Metro 0.72.0 before that NodeJS Set was used.
+ *
+ * https://github.com/facebook/metro/blob/fc29a1177f883144674cf85a813b58567f69d545/packages/metro/src/lib/CountingSet.js
+ */
+function resolveSetCreator(): () => CountingSet<string> {
+  const CountingSetFromPrivate = safeRequireCountingSetFromPrivate();
+  if (CountingSetFromPrivate) {
+    return () => new CountingSetFromPrivate.default();
+  }
+
+  const CountingSetFromSrc = safeRequireCountingSetFromSrc();
+  if (CountingSetFromSrc) {
+    return () => new CountingSetFromSrc.default();
+  }
+
+  return () => new Set() as unknown as CountingSet<string>;
+}
+
+/**
+ * CountingSet was added in Metro 0.72.0 before that NodeJS Set was used.
+ *
+ * https://github.com/facebook/metro/blob/fc29a1177f883144674cf85a813b58567f69d545/packages/metro/src/lib/CountingSet.js
+ */
+function safeRequireCountingSetFromSrc(): { default: new <T>() => CountingSet<T> } | undefined {
+  try {
+    return require('metro/src/lib/CountingSet');
+  } catch (e) {
+    return undefined;
+  }
+}
+
+/**
+ * CountingSet was moved to private in Metro 0.83.0. (all src exports were moved to private)
+ *
+ * https://github.com/facebook/metro/commit/ae6f42372ed361611b5672705f22081c2022cf28
+ */
+function safeRequireCountingSetFromPrivate(): { default: new <T>() => CountingSet<T> } | undefined {
+  try {
+    return require('metro/private/lib/CountingSet');
+  } catch (e) {
+    return undefined;
+  }
+}
+
+export const createSet = resolveSetCreator();
+
+const PRELUDE_MODULE_PATH = '__prelude__';
+
+/**
+ * Prepends the module after default required prelude modules.
+ */
+export function prependModule(
+  modules: readonly Module<MixedOutput>[],
+  module: Module<VirtualJSOutput>,
+): Module<MixedOutput>[] {
+  const modifiedPreModules = [...modules];
+  if (modifiedPreModules.length > 0 && modifiedPreModules[0]?.path === PRELUDE_MODULE_PATH) {
+    // prelude module must be first as it measures the bundle startup time
+    modifiedPreModules.unshift(modules[0] as Module<VirtualJSOutput>);
+    modifiedPreModules[1] = module;
+  } else {
+    modifiedPreModules.unshift(module);
+  }
+  return modifiedPreModules;
+}
+
+/**
+ * Creates a virtual JS module with the given path and code.
+ */
+export function createVirtualJSModule(
+  modulePath: string,
+  moduleCode: string,
+): Module<VirtualJSOutput> & { setSource: (code: string) => void } {
+  let sourceCode = moduleCode;
+
+  return {
+    setSource: (code: string) => {
+      sourceCode = code;
+    },
+    dependencies: new Map(),
+    getSource: () => Buffer.from(sourceCode),
+    inverseDependencies: createSet(),
+    path: modulePath,
+    output: [
+      {
+        type: 'js/script/virtual',
+        data: {
+          code: sourceCode,
+          lineCount: countLines(sourceCode),
+          map: [],
+        },
+      },
+    ],
+  };
+}
+
+/**
+ * Tries to load Expo config using `@expo/config` package.
+ */
+export function getExpoConfig(projectRoot: string): Partial<{
+  name: string;
+  version: string;
+}> {
+  try {
+    const expoConfig = require('@expo/config') as {
+      getConfig?: (projectRoot: string) => { exp: Record<string, unknown> };
+    };
+    if (expoConfig.getConfig) {
+      const { exp } = expoConfig.getConfig(projectRoot);
+      return {
+        name: typeof exp.name === 'string' && exp.name ? exp.name : undefined,
+        version: typeof exp.version === 'string' && exp.version ? exp.version : undefined,
+      };
+    }
+  } catch {
+    // @expo/config not available, do nothing
+  }
+
+  return {};
+}

@@ -1,0 +1,48 @@
+{
+  "extends": "./node_modules/@sentry/typescript/tsconfig.json",
+  "include": [
+    "./src/js/*.ts",
+    "./src/js/*.tsx",
+    "./src/js/playground/*.ts",
+    "./src/js/playground/*.tsx",
+    "./src/js/**/*.web.ts",
+    "./src/js/**/*.web.tsx",
+    "./typings/react-native.d.ts",
+    "./typings/global.d.ts"
+  ],
+  "exclude": ["node_modules"],
+  "compilerOptions": {
+    // @sentry/typescript@10.59.0 switched its base config to `moduleResolution: bundler`,
+    // which honors `react-native`'s exports map and fails to resolve subpaths like
+    // `react-native/types`. Pin classic node resolution to keep these imports working.
+    "moduleResolution": "node",
+    "paths": {
+      "metro": ["./node_modules/metro/src/index"],
+      // `@sentry/bundler-plugins` exposes the component-annotate plugin via the `./babel-plugin`
+      // subpath export, which classic `node` resolution can't follow. Point directly at its types.
+      "@sentry/bundler-plugins/babel-plugin": [
+        "./node_modules/@sentry/bundler-plugins/build/types/babel-plugin/index.d.ts"
+      ],
+      // react-native >=0.87 dropped its root `types` field; its type definitions are now only
+      // reachable through the package `exports` map, which classic `node` resolution can't follow.
+      // Point directly at the shipped legacy type definitions (`types_DEPRECATED` since 0.88; what earlier RN versions' root
+      // `types` field resolved to), so both `import ... from 'react-native'` and the global types
+      // keep resolving.
+      "react-native": ["./node_modules/react-native/types_DEPRECATED/index.d.ts"]
+    },
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": [
+      "es7"
+    ],
+    "jsx": "react",
+    // react-native's global types are pulled in via the `paths` mapping above; classic `node`
+    // resolution can no longer discover them through the removed root `types` field.
+    "types": [],
+    "target": "es2018",
+    "module": "es6",
+    "skipLibCheck": true,
+    "strictBindCallApply": true,
+    "importHelpers": false
+  }
+}

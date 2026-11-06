@@ -1,0 +1,249 @@
+/* oxlint-disable typescript-eslint(no-unsafe-member-access) */
+import type { ExpoConfig } from '@expo/config-types';
+import type { ConfigPlugin, XcodeProject } from 'expo/config-plugins';
+
+import { withAppDelegate, withDangerousMod, withXcodeProject } from 'expo/config-plugins';
+import * as path from 'path';
+
+import { warnOnce } from './logger';
+import { writeSentryPropertiesTo } from './utils';
+
+type BuildPhase = { shellScript: string };
+
+const SENTRY_REACT_NATIVE_XCODE_PATH =
+  "`\"$NODE_BINARY\" --print \"require('path').dirname(require.resolve('@sentry/react-native/package.json')) + '/scripts/sentry-xcode.sh'\"`";
+const SENTRY_REACT_NATIVE_XCODE_DEBUG_FILES_PATH =
+  "`\"${NODE_BINARY:-node}\" --print \"require('path').dirname(require.resolve('@sentry/react-native/package.json')) + '/scripts/sentry-xcode-debug-files.sh'\"`";
+const SENTRY_DISABLE_AUTO_UPLOAD_EXPORT = 'export SENTRY_DISABLE_AUTO_UPLOAD=true';
+// Xcode started from the Dock has no node on PATH, so load NODE_BINARY the same way as with-environment.sh.
+// Swift Package Manager projects have no PODS_ROOT, so use SRCROOT as React Native's SPM build phases do.
+const LOAD_XCODE_ENV = `XCODE_ENV_DIR="\${PODFILE_DIR:-\${PODS_ROOT:+$PODS_ROOT/..}}"
+XCODE_ENV_PATH="\${XCODE_ENV_DIR:-$SRCROOT}/.xcode.env"
+[ -f "$XCODE_ENV_PATH" ] && . "$XCODE_ENV_PATH"
+[ -f "$XCODE_ENV_PATH.local" ] && . "$XCODE_ENV_PATH.local"
+`;
+
+export const withSentryIOS: ConfigPlugin<{
+  sentryProperties: string;
+  useNativeInit: boolean | undefined;
+  disableAutoUpload: boolean | undefined;
+}> = (config, { sentryProperties, useNativeInit = false, disableAutoUpload = false }) => {
+  const xcodeProjectCfg = withXcodeProject(config, config => {
+    const xcodeProject: XcodeProject = config.modResults;
+
+    const sentryBuildPhase = xcodeProject.pbxItemByComment(
+      'Upload Debug Symbols to Sentry',
+      'PBXShellScriptBuildPhase',
+    );
+    if (!sentryBuildPhase) {
+      xcodeProject.addBuildPhase([], 'PBXShellScriptBuildPhase', 'Upload Debug Symbols to Sentry', null, {
+        shellPath: '/bin/sh',
+        shellScript: getDebugFilesUploadScript(disableAutoUpload),
+      });
+    } else {
+      // The "Upload Debug Symbols to Sentry" phase is entirely Sentry-owned, so rewrite it to the
+      // freshly generated script. This keeps in-place upgrades (without `expo prebuild --clean`) in
+      // sync: they pick up the space-safe quoting fix (#6583) and the correct disableAutoUpload state.
+      overwriteDebugFilesUploadScript(sentryBuildPhase, disableAutoUpload);
+    }
+
+    const bundleReactNativePhase = xcodeProject.pbxItemByComment(
+      'Bundle React Native code and images',
+      'PBXShellScriptBuildPhase',
+    );
+    modifyExistingXcodeBuildScript(bundleReactNativePhase, disableAutoUpload);
+
+    return config;
+  });
+
+  const appDelegateCfc = useNativeInit ? modifyAppDelegate(xcodeProjectCfg) : xcodeProjectCfg;
+
+  return withDangerousMod(appDelegateCfc, [
+    'ios',
+    config => {
+      writeSentryPropertiesTo(path.resolve(config.modRequest.projectRoot, 'ios'), sentryProperties);
+      return config;
+    },
+  ]);
+};
+
+export function modifyExistingXcodeBuildScript(script: BuildPhase, disableAutoUpload: boolean = false): void {
+  if (!script.shellScript.match(/(packager|scripts)\/react-native-xcode\.sh\b/)) {
+    warnOnce(
+      `'react-native-xcode.sh' not found in 'Bundle React Native code and images'.
+Please open a bug report at https://github.com/getsentry/sentry-react-native`,
+    );
+    return;
+  }
+
+  if (script.shellScript.includes('sentry-xcode.sh')) {
+    // Re-quote an existing (possibly pre-fix) Sentry bundle line so in-place upgrades without
+    // `expo prebuild --clean` also pick up the space-safe quoting fix (#6583).
+    requoteExistingSentryBundleScript(script);
+    if (disableAutoUpload) {
+      addDisableAutoUploadToExistingScript(script);
+    } else {
+      removeDisableAutoUploadFromExistingScript(script);
+    }
+    return;
+  }
+
+  if (script.shellScript.includes('@sentry')) {
+    warnOnce(
+      `Outdated or custom Sentry script found in 'Bundle React Native code and images'.
+Regenerate the native project to use the latest script.
+Run npx expo prebuild --clean`,
+    );
+    return;
+  }
+
+  const code = JSON.parse(script.shellScript);
+  script.shellScript = JSON.stringify(addSentryWithBundledScriptsToBundleShellScript(code, disableAutoUpload));
+}
+
+export function addSentryWithBundledScriptsToBundleShellScript(
+  script: string,
+  disableAutoUpload: boolean = false,
+): string {
+  const disableAutoUploadExport = disableAutoUpload ? `${SENTRY_DISABLE_AUTO_UPLOAD_EXPORT}\n` : '';
+  // Match through end-of-line so command substitutions in Expo templates stay intact.
+  // Quote unquoted invocations so paths containing spaces remain one argument (#6583).
+  // Preserve existing outer double quotes: adding another pair would expose the
+  // command substitution's result to word splitting.
+  return script.replace(/^.*?(packager|scripts)\/react-native-xcode\.sh.*$/m, (match: string) => {
+    const invocation = match.trim();
+    const argument = invocation.startsWith('"') && invocation.endsWith('"') ? invocation : `"${invocation}"`;
+    return `${disableAutoUploadExport}/bin/sh "${SENTRY_REACT_NATIVE_XCODE_PATH}" ${argument}`;
+  });
+}
+
+export function getDebugFilesUploadScript(disableAutoUpload: boolean = false): string {
+  // The resolved script path is wrapped in double quotes so a project path containing spaces is
+  // passed to `/bin/sh` as a single argument instead of being word-split. See issue #6583.
+  const disableAutoUploadExport = disableAutoUpload ? `${SENTRY_DISABLE_AUTO_UPLOAD_EXPORT}\n` : '';
+  return `${disableAutoUploadExport}${LOAD_XCODE_ENV}/bin/sh "${SENTRY_REACT_NATIVE_XCODE_DEBUG_FILES_PATH}"`;
+}
+
+export function requoteExistingSentryBundleScript(script: BuildPhase): void {
+  try {
+    const code = JSON.parse(script.shellScript);
+    script.shellScript = JSON.stringify(requoteSentryBundleLine(code));
+  } catch {
+    script.shellScript = requoteSentryBundleLine(script.shellScript);
+  }
+}
+
+function requoteSentryBundleLine(code: string): string {
+  const quotedPrefix = `/bin/sh "${SENTRY_REACT_NATIVE_XCODE_PATH}"`;
+  // Already quoted (current form) or an unknown/custom line: leave it untouched.
+  if (code.includes(quotedPrefix)) {
+    return code;
+  }
+  const unquotedPrefix = `/bin/sh ${SENTRY_REACT_NATIVE_XCODE_PATH} `;
+  const start = code.indexOf(unquotedPrefix);
+  if (start === -1) {
+    return code;
+  }
+  const newlineIndex = code.indexOf('\n', start);
+  const end = newlineIndex === -1 ? code.length : newlineIndex;
+  // Everything after the Sentry script path to end-of-line is the react-native-xcode.sh invocation
+  // (a plain path in the default template, a backtick command substitution in the bare/monorepo one).
+  const invocation = code.slice(start + unquotedPrefix.length, end);
+  const requotedLine = `/bin/sh "${SENTRY_REACT_NATIVE_XCODE_PATH}" "${invocation}"`;
+  return code.slice(0, start) + requotedLine + code.slice(end);
+}
+
+export function overwriteDebugFilesUploadScript(script: BuildPhase, disableAutoUpload: boolean = false): void {
+  // Existing phases are stored JSON-encoded by the `xcode` library (see the create path, which passes a
+  // raw string that the library encodes on write). Re-encode the freshly generated script the same way so
+  // it is written back verbatim without double-encoding.
+  script.shellScript = JSON.stringify(getDebugFilesUploadScript(disableAutoUpload));
+}
+
+export function addDisableAutoUploadToExistingScript(script: BuildPhase): void {
+  if (script.shellScript.includes('SENTRY_DISABLE_AUTO_UPLOAD')) {
+    return;
+  }
+  try {
+    const code = JSON.parse(script.shellScript);
+    script.shellScript = JSON.stringify(insertExportAfterDelimiter(code));
+  } catch {
+    script.shellScript = `${SENTRY_DISABLE_AUTO_UPLOAD_EXPORT}\n${script.shellScript}`;
+  }
+}
+
+function insertExportAfterDelimiter(script: string): string {
+  if (script.startsWith('"')) {
+    const rest = script.slice(1).replace(/^\n/, '');
+    return `"\n${SENTRY_DISABLE_AUTO_UPLOAD_EXPORT}\n${rest}`;
+  }
+  return `${SENTRY_DISABLE_AUTO_UPLOAD_EXPORT}\n${script}`;
+}
+
+export function removeDisableAutoUploadFromExistingScript(script: BuildPhase): void {
+  if (!script.shellScript.includes('SENTRY_DISABLE_AUTO_UPLOAD')) {
+    return;
+  }
+  try {
+    const code = JSON.parse(script.shellScript);
+    script.shellScript = JSON.stringify(code.replace(/^export SENTRY_DISABLE_AUTO_UPLOAD=true\n?/m, ''));
+  } catch {
+    script.shellScript = script.shellScript.replace(/^export SENTRY_DISABLE_AUTO_UPLOAD=true\n?/m, '');
+  }
+}
+
+export function modifyAppDelegate(config: ExpoConfig): ExpoConfig {
+  return withAppDelegate(config, async config => {
+    if (!config.modResults?.path) {
+      warnOnce("Can't add 'RNSentrySDK.start()' to the iOS AppDelegate, because the file was not found.");
+      return config;
+    }
+
+    const fileName = path.basename(config.modResults.path);
+
+    if (config.modResults.language === 'swift') {
+      if (config.modResults.contents.includes('RNSentrySDK.start()')) {
+        warnOnce(`Your '${fileName}' already contains 'RNSentrySDK.start()'.`);
+        return config;
+      }
+      // Add RNSentrySDK.start() at the beginning of application method
+      const originalContents = config.modResults.contents;
+      config.modResults.contents = config.modResults.contents.replace(
+        /(func application\([^)]*\) -> Bool \{)\s*\n(\s*)/s,
+        '$1\n$2RNSentrySDK.start()\n$2',
+      );
+      if (config.modResults.contents === originalContents) {
+        warnOnce(`Failed to insert 'RNSentrySDK.start()' in '${fileName}'.`);
+      } else if (!config.modResults.contents.includes('import RNSentry')) {
+        // Insert import statement after the first import (works for both UIKit and Expo imports)
+        config.modResults.contents = config.modResults.contents.replace(/(import \S+\n)/, '$1import RNSentry\n');
+      }
+    } else if (['objcpp', 'objc'].includes(config.modResults.language)) {
+      if (config.modResults.contents.includes('[RNSentrySDK start]')) {
+        warnOnce(`Your '${fileName}' already contains '[RNSentrySDK start]'.`);
+        return config;
+      }
+      // Add [RNSentrySDK start] at the beginning of application:didFinishLaunchingWithOptions method
+      const originalContents = config.modResults.contents;
+      config.modResults.contents = config.modResults.contents.replace(
+        /(- \(BOOL\)application:[\s\S]*?didFinishLaunchingWithOptions:[\s\S]*?\{\n)(\s*)/s,
+        '$1$2[RNSentrySDK start];\n$2',
+      );
+      if (config.modResults.contents === originalContents) {
+        warnOnce(`Failed to insert '[RNSentrySDK start]' in '${fileName}.`);
+      } else if (!config.modResults.contents.includes('#import <RNSentry/RNSentry.h>')) {
+        // Add import after AppDelegate.h
+        config.modResults.contents = config.modResults.contents.replace(
+          /(#import "AppDelegate.h"\n)/,
+          '$1#import <RNSentry/RNSentry.h>\n',
+        );
+      }
+    } else {
+      warnOnce(
+        `Unsupported language '${config.modResults.language}' detected in '${fileName}', the native code won't be updated.`,
+      );
+    }
+
+    return config;
+  });
+}

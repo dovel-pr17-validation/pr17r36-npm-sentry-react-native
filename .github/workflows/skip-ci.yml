@@ -1,0 +1,68 @@
+name: Skip CI
+on:
+  workflow_call:
+    outputs:
+      skip_ci:
+        description: "Value yes if the current PR only contains changes to files not related to code, otherwise, not defined."
+        value: ${{ jobs.diff_check.outputs.skip_ci }}
+
+jobs:
+  diff_check:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_REF: ${{ github.base_ref }}
+      HEAD_REF: ${{ github.head_ref }}
+    outputs:
+      skip_ci:
+        ${{ steps.check_diff.outputs.skip_ci }}
+    steps:
+      - name: Check if is PR
+        id: check-pr
+        run: |
+          if [ -z "$PR_NUMBER" ] || [ -z "$BASE_REF" ] || [ -z "$HEAD_REF" ]; then
+            echo "This action is intended to be run on pull requests only."
+            echo "is-pr=false" >> $GITHUB_OUTPUT
+          else
+            echo "is-pr=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout PR Base Branch
+        if: steps.check-pr.outputs.is-pr == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.base_ref }}
+
+      - name: Checkout PR Head Branch
+        if: steps.check-pr.outputs.is-pr == 'true'
+        run: |
+          git fetch origin "pull/$PR_NUMBER/head:$HEAD_REF"
+          git checkout "$HEAD_REF"
+
+      - name: Check diff from Pull Request
+        if: steps.check-pr.outputs.is-pr == 'true'
+        id: check_diff
+        run: |
+          skipList=(".github/CODEOWNERS" ".prettierignore" ".github/workflows/update-deps.yml" ".github/workflows/skip-ci.yml" ".claude/settings.json" "agents.toml")
+          skipRegList=("(.*/)?\.gitignore" "\.github/ISSUE_TEMPLATE.*")
+
+          for s in "${skipRegList[@]}"; do
+            skipRegex+="$s|"
+          done
+          # Remove trailing |
+          skipRegex=${skipRegex%|}
+
+          # Ignores changelog.md, readme.md,...
+          fileChangesArray=($(git diff --name-only "$BASE_REF...$HEAD_REF" | grep -v '\.md$' || true))
+          printf '%s\n' "${fileChangesArray[@]}"
+          for item in "${fileChangesArray[@]}"
+          do
+            if [[ ! " ${skipList[*]} " =~ " ${item} " ]] && [[ ! "${item}" =~ ^(${skipRegex})$ ]]; then
+              echo "found '${item}' that doesn't belong to the skip list."
+              exit 0
+            fi
+          done
+          echo "skip_ci=true" >> $GITHUB_OUTPUT
+          echo "no source code files commited, skipping CI."

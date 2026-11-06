@@ -1,0 +1,492 @@
+#!/usr/bin/env node
+'use strict';
+
+import { execSync, execFileSync, spawn } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import { argv, env } from 'process';
+import { fileURLToPath } from 'node:url';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+if (argv.length < 3) {
+  console.error(`Usage: ${path.basename(__filename)} <platform>`);
+  process.exit(1);
+}
+
+const platform = argv[2];
+if (platform !== 'ios' && platform !== 'android') {
+  console.error(`Unsupported platform: ${platform}`);
+  process.exit(1);
+}
+
+var actions = ['create', 'build', 'test'];
+if (argv.length >= 4) {
+  var newActions = [];
+  for (let index = 0; index < actions.length; index++) {
+    const action = actions[index];
+    if (argv.includes(`--${action}`) || argv.includes(`-${action}`) || argv.includes(action)) {
+      newActions.push(action);
+    }
+  }
+  actions = newActions;
+}
+console.log(`Performing actions: ${actions}`);
+
+if (env.SENTRY_DISABLE_AUTO_UPLOAD === undefined) {
+  // Auto upload to prod made the CI flaky
+  // This can be removed in the future or when mocked server is added
+  env.SENTRY_DISABLE_AUTO_UPLOAD = 'true';
+}
+
+if (env.PRODUCTION === undefined && env.CI == undefined) {
+  // When executed locally and PROD not specified most likely we wanted production build
+  env.PRODUCTION = 1;
+}
+
+if (!env.USE_FRAMEWORKS || env.USE_FRAMEWORKS === 'no') {
+  // In case it's set to an empty string, it causes issues in Podfile.
+  delete env.USE_FRAMEWORKS;
+}
+
+const e2eDir = path.resolve(__dirname);
+const e2eTestPackageName = JSON.parse(fs.readFileSync(`${e2eDir}/package.json`, 'utf8')).name;
+const patchScriptsDir = path.resolve(e2eDir, 'patch-scripts');
+const workspaceRootDir = path.resolve(__dirname, '../..');
+const corePackageDir = path.resolve(workspaceRootDir, 'packages/core');
+const expoUploadSourcemapsPackageDir = path.resolve(workspaceRootDir, 'packages/expo-upload-sourcemaps');
+const corePackageJson = JSON.parse(fs.readFileSync(`${corePackageDir}/package.json`, 'utf8'));
+const RNVersion = env.RN_VERSION ? env.RN_VERSION : corePackageJson.devDependencies['react-native'];
+const RNEngine = env.RN_ENGINE ? env.RN_ENGINE : 'hermes';
+const buildType = env.PRODUCTION ? 'Release' : 'Debug';
+const appSourceRepo = 'https://github.com/react-native-community/rn-diff-purge.git';
+const appRepoDir = `${e2eDir}/react-native-versions/${RNVersion}`;
+const appName = 'RnDiffApp';
+const appDir = `${appRepoDir}/${appName}`;
+const testAppName = `${appName}.${platform === 'ios' ? 'app' : 'apk'}`;
+const testApp = `${e2eDir}/${testAppName}`;
+const appId = platform === 'ios' ? 'org.reactjs.native.example.RnDiffApp' : 'com.rndiffapp';
+const sentryAuthToken = env.SENTRY_AUTH_TOKEN;
+
+function runCodegenIfNeeded(rnVersion, platform, appDir) {
+  const versionNumber = parseFloat(rnVersion.replace(/[^\d.]/g, ''));
+  const shouldRunCodegen = platform === 'android' && versionNumber >= 0.80;
+
+  if (shouldRunCodegen) {
+    console.log(`Running codegen for React Native ${rnVersion}...`);
+    try {
+      execSync('./gradlew generateCodegenArtifactsFromSchema', {
+        stdio: 'inherit',
+        cwd: path.join(appDir, 'android'),
+        env: env
+      });
+      console.log('Gradle codegen task completed successfully');
+    } catch (error) {
+      console.error('Codegen failed:', error.message);
+    }
+  } else {
+    console.log(`Skipping codegen for React Native ${rnVersion}`);
+  }
+}
+
+function patchBoostIfNeeded(rnVersion, patchScriptsDir) {
+  const versionNumber = parseFloat(rnVersion.replace(/[^\d.]/g, ''));
+  const shouldPatchBoost = platform === 'ios' && versionNumber <= 0.80;
+
+  if (!shouldPatchBoost) {
+    console.log(`Skipping boost patch for React Native ${rnVersion}`);
+    return;
+  }
+  execSync(`${patchScriptsDir}/rn.patch.boost.js --podspec node_modules/react-native/third-party-podspecs/boost.podspec`, {
+    stdio: 'inherit',
+    cwd: appDir,
+    env: env,
+  });
+}
+
+// RN < 0.72 runs its iOS codegen while CocoaPods evaluates the Podfile
+// (`use_react_native!`), and that codegen passes `quirks_mode: true` to the
+// json gem. json 3.0.0 removed the `quirks_mode` option, so a fresh
+// `bundle install` (the rn-diff-purge Gemfile pins cocoapods but not json)
+// resolves json 3.0.0 and pod install fails with
+// "Invalid `Podfile` file: unknown keyword: quirks_mode.". Pin json below 3.0
+// for these older RN versions. Newer RN codegen dropped the option and is
+// unaffected.
+function pinJsonGemIfNeeded(rnVersion, appDir) {
+  const versionNumber = parseFloat(rnVersion.replace(/[^\d.]/g, ''));
+  const gemfilePath = `${appDir}/Gemfile`;
+  if (platform !== 'ios' || versionNumber >= 0.72 || !fs.existsSync(gemfilePath)) {
+    return;
+  }
+  console.log(`Pinning json gem < 3.0 for React Native ${rnVersion}`);
+  fs.appendFileSync(gemfilePath, `\ngem 'json', '< 3.0'\n`, { encoding: 'utf-8' });
+}
+
+// Build and publish the SDK - we only need to do this once in CI.
+// Locally, we may want to get updates from the latest build so do it on every app build.
+if (actions.includes('create') || (env.CI === undefined && actions.includes('build'))) {
+  execSync(`yarn build`, { stdio: 'inherit', cwd: workspaceRootDir, env: { ...env, PLATFORM: platform } });
+  execSync(`yalc publish --private`, { stdio: 'inherit', cwd: e2eDir, env: env });
+  execSync(`yalc publish`, { stdio: 'inherit', cwd: expoUploadSourcemapsPackageDir, env: env });
+  execSync(`yalc publish`, { stdio: 'inherit', cwd: corePackageDir, env: env });
+}
+
+if (actions.includes('create')) {
+  // Clone the test app repo
+  if (fs.existsSync(appRepoDir)) fs.rmSync(appRepoDir, { recursive: true });
+  execSync(`git clone ${appSourceRepo} --branch release/${RNVersion} --single-branch ${appRepoDir}`, {
+    stdio: 'inherit',
+    env: env,
+  });
+
+  // Install dependencies
+  // yalc add doesn't fail if the package is not found - it skips silently.
+  let yalcAddOutput = execSync(`yalc add @sentry/expo-upload-sourcemaps`, { cwd: appDir, env: env, encoding: 'utf-8' });
+  if (!yalcAddOutput.match(/Package .* added ==>/)) {
+    console.error(yalcAddOutput);
+    process.exit(1);
+  } else {
+    console.log(yalcAddOutput.trim());
+  }
+  yalcAddOutput = execSync(`yalc add @sentry/react-native`, { cwd: appDir, env: env, encoding: 'utf-8' });
+  if (!yalcAddOutput.match(/Package .* added ==>/)) {
+    console.error(yalcAddOutput);
+    process.exit(1);
+  } else {
+    console.log(yalcAddOutput.trim());
+  }
+  yalcAddOutput = execSync(`yalc add ${e2eTestPackageName}`, { cwd: appDir, env: env, encoding: 'utf-8' });
+  if (!yalcAddOutput.match(/Package .* added ==>/)) {
+    console.error(yalcAddOutput);
+    process.exit(1);
+  } else {
+    console.log(yalcAddOutput.trim());
+  }
+
+  // Force yarn to resolve the transitive @sentry/expo-upload-sourcemaps dep
+  // to the local yalc copy. Without this, yarn tries to fetch it from the
+  // npm registry (because yalc rewrites the workspace:* spec in core's
+  // published package.json to a concrete version) and 404s until the package
+  // is released.
+  const appPackageJsonPath = `${appDir}/package.json`;
+  const appPackageJson = JSON.parse(fs.readFileSync(appPackageJsonPath, 'utf-8'));
+  appPackageJson.resolutions = {
+    ...appPackageJson.resolutions,
+    '@sentry/expo-upload-sourcemaps': 'file:.yalc/@sentry/expo-upload-sourcemaps',
+  };
+  fs.writeFileSync(appPackageJsonPath, JSON.stringify(appPackageJson, null, 2) + '\n');
+
+  // original yarnrc contains the exact yarn version which causes corepack to fail to install yarn v3
+  fs.writeFileSync(`${appDir}/.yarnrc.yml`, 'nodeLinker: node-modules\n', { encoding: 'utf-8' });
+
+  // The generated app pins its own yarn version (varies by RN version: e.g. v3 for
+  // older RN, v4 for newer). yarn 4 quarantines any package newer than
+  // npmMinimalAgeGate (default 1 day) — and auto-enables that gate on public-PR CI —
+  // so a just-published first-party @sentry/* version (e.g. right after a JS SDK bump)
+  // resolved fresh from this app's empty lockfile fails the install. Disable the gate,
+  // but only when the app's yarn supports the setting: yarn 3 hard-errors on unknown
+  // settings, and it has no age gate to begin with. Probe support rather than guess a
+  // version threshold.
+  const appYarnSupportsAgeGate =
+    execSync(`yarn config npmMinimalAgeGate > /dev/null 2>&1; echo $?`, {
+      cwd: appDir,
+      env: env,
+      encoding: 'utf-8',
+    }).trim() === '0';
+  if (appYarnSupportsAgeGate) {
+    fs.appendFileSync(`${appDir}/.yarnrc.yml`, 'npmMinimalAgeGate: 0\n', { encoding: 'utf-8' });
+  }
+  // yarn v3 won't install dependencies in a sub project without a yarn.lock file present
+  fs.writeFileSync(`${appDir}/yarn.lock`, '');
+
+  execSync(`yarn install`, {
+    stdio: 'inherit',
+    cwd: appDir,
+    // yarn v3 run immutable install by default in CI
+    env: Object.assign(env, { YARN_ENABLE_IMMUTABLE_INSTALLS: false }),
+  });
+
+  execSync(`yarn add react-native-launch-arguments@4.0.2`, {
+    stdio: 'inherit',
+    cwd: appDir,
+    // yarn v3 run immutable install by default in CI
+    env: Object.assign(env, { YARN_ENABLE_IMMUTABLE_INSTALLS: false }),
+  });
+
+  // Patch react-native-launch-arguments for Gradle 9+ compatibility (Android) and React Native 0.84+ compatibility (iOS)
+  execSync(`${patchScriptsDir}/rn.patch.launch-arguments.js --app-dir .`, {
+    stdio: 'inherit',
+    cwd: appDir,
+    env: env,
+  });
+
+  // Replace the dead OSSRH snapshots repo hardcoded by older RN Gradle plugins
+  // (oss.sonatype.org is EOL and intermittently 504s, breaking dependency resolution).
+  execSync(`${patchScriptsDir}/rn.patch.gradle.plugin.repo.js --app-dir .`, {
+    stdio: 'inherit',
+    cwd: appDir,
+    env: env,
+  });
+
+  // Patch the app
+  execSync(`patch --verbose --strip=0 --force --ignore-whitespace --fuzz 4 < ${patchScriptsDir}/rn.patch`, {
+    stdio: 'inherit',
+    cwd: appDir,
+    env: env,
+  });
+  execSync(`${patchScriptsDir}/rn.patch.app.js --app .`, { stdio: 'inherit', cwd: appDir, env: env });
+  execSync(`${patchScriptsDir}/rn.patch.metro.config.js --path metro.config.js`, {
+    stdio: 'inherit',
+    cwd: appDir,
+    env: env,
+  });
+
+  // Patch boost
+  patchBoostIfNeeded(RNVersion, patchScriptsDir);
+
+  // Set up platform-specific app configuration
+  if (platform === 'ios') {
+    execSync('ruby --version', { stdio: 'inherit', cwd: `${appDir}`, env: env });
+
+    execSync(`${patchScriptsDir}/rn.patch.podfile.js --pod-file Podfile --engine ${RNEngine}`, {
+      stdio: 'inherit',
+      cwd: `${appDir}/ios`,
+      env: env,
+    });
+
+    // Clean Pods to ensure CocoaPods reads the patched podspec
+    if (fs.existsSync(`${appDir}/ios/Pods`)) {
+      fs.rmSync(`${appDir}/ios/Pods`, { recursive: true });
+    }
+    if (fs.existsSync(`${appDir}/ios/Podfile.lock`)) {
+      fs.rmSync(`${appDir}/ios/Podfile.lock`);
+    }
+
+    pinJsonGemIfNeeded(RNVersion, appDir);
+
+    if (fs.existsSync(`${appDir}/Gemfile`)) {
+      execSync(`bundle install`, { stdio: 'inherit', cwd: appDir, env: env });
+      execSync('bundle exec pod install --repo-update', { stdio: 'inherit', cwd: `${appDir}/ios`, env: env });
+    } else {
+      execSync('pod install --repo-update', { stdio: 'inherit', cwd: `${appDir}/ios`, env: env });
+    }
+    execSync('cat Podfile.lock | grep RNSentry', { stdio: 'inherit', cwd: `${appDir}/ios`, env: env });
+
+    execSync(
+      `${patchScriptsDir}/rn.patch.xcode.js --project ios/${appName}.xcodeproj/project.pbxproj --rn-version ${RNVersion}`,
+      { stdio: 'inherit', cwd: appDir, env: env },
+    );
+  } else if (platform === 'android') {
+    execSync(
+      `${patchScriptsDir}//rn.patch.gradle.properties.js --gradle-properties android/gradle.properties --engine ${RNEngine}`,
+      { stdio: 'inherit', cwd: appDir, env: env },
+    );
+    execSync(`${patchScriptsDir}/rn.patch.app.build.gradle.js --app-build-gradle android/app/build.gradle`, {
+      stdio: 'inherit',
+      cwd: appDir,
+      env: env,
+    });
+
+    if (env.RCT_NEW_ARCH_ENABLED) {
+      execSync(`perl -i -pe's/newArchEnabled=false/newArchEnabled=true/g' android/gradle.properties`, {
+        stdio: 'inherit',
+        cwd: appDir,
+        env: env,
+      });
+      console.log('New Architecture enabled');
+    }
+  }
+}
+
+if (actions.includes('build')) {
+  console.log(`Building ${platform}: ${buildType}`);
+  var appProduct;
+
+  if (platform === 'ios') {
+    // Build iOS test app
+    execSync(
+      `set -o pipefail && xcodebuild \
+                  -workspace ${appName}.xcworkspace \
+                  -configuration ${buildType} \
+                  -scheme ${appName} \
+                  -sdk 'iphonesimulator' \
+                  -destination 'generic/platform=iOS Simulator' \
+                  ONLY_ACTIVE_ARCH=yes \
+                  -derivedDataPath DerivedData \
+                  build | tee xcodebuild.log | xcbeautify`,
+      { stdio: 'inherit', cwd: `${appDir}/ios`, env: env },
+    );
+
+    appProduct = `${appDir}/ios/DerivedData/Build/Products/${buildType}-iphonesimulator/${appName}.app`;
+  } else if (platform === 'android') {
+    runCodegenIfNeeded(RNVersion, platform, appDir);
+
+    execSync(`./gradlew assemble${buildType} -PreactNativeArchitectures=x86 --no-daemon`, {
+      stdio: 'inherit',
+      cwd: `${appDir}/android`,
+      env: env,
+    });
+    appProduct = `${appDir}/android/app/build/outputs/apk/release/app-release.apk`;
+  }
+
+  console.log(`Moving ${appProduct} to ${testApp}`);
+  if (fs.existsSync(testApp)) fs.rmSync(testApp, { recursive: true });
+  fs.renameSync(appProduct, testApp);
+}
+
+if (actions.includes('test')) {
+  // Run e2e tests
+  if (platform === 'ios') {
+    try {
+      execSync('xcrun simctl list devices | grep -q "(Booted)"');
+    } catch (error) {
+      throw new Error('No simulator is currently booted. Please boot a simulator before running this script.');
+    }
+
+    execFileSync('xcrun', ['simctl', 'install', 'booted', testApp]);
+  } else if (platform === 'android') {
+    try {
+      execSync('adb devices | grep -q "emulator"');
+    } catch (error) {
+      throw new Error('No Android emulator is currently running. Please start an emulator before running this script.');
+    }
+
+    execFileSync('adb', ['install', '-r', '-d', testApp]);
+  }
+
+  if (!sentryAuthToken) {
+    console.log('Skipping maestro test due to unavailable or empty SENTRY_AUTH_TOKEN');
+  } else {
+    const maestroDir = path.join(e2eDir, 'maestro');
+    const flowFiles = fs.readdirSync(maestroDir)
+      .filter(f => f.endsWith('.yml') && !f.startsWith('utils'))
+      .sort((a, b) => {
+        // Run crash.yml last — it kills the app via nativeCrash(), and
+        // post-crash simulator state can be flaky on Cirrus Labs Tart VMs.
+        if (a === 'crash.yml') return 1;
+        if (b === 'crash.yml') return -1;
+        return a.localeCompare(b);
+      });
+
+    console.log(`Discovered ${flowFiles.length} Maestro flows: ${flowFiles.join(', ')}`);
+
+    // Warm up Maestro's driver connection before running test flows.
+    // The first Maestro launchApp after simulator boot can fail on Cirrus
+    // Labs Tart VMs because the IDB/XCUITest driver isn't fully connected.
+    // Running a lightweight warmup flow ensures the driver is ready.
+    const warmupFlow = path.join('maestro', 'utils', 'warmup.yml');
+    console.log('Warming up Maestro driver...');
+    try {
+      execFileSync('maestro', [
+        'test',
+        warmupFlow,
+        '--env', `APP_ID=${appId}`,
+        '--env', `SENTRY_AUTH_TOKEN=${sentryAuthToken}`,
+      ], {
+        stdio: 'pipe',
+        cwd: e2eDir,
+      });
+    } catch (error) {
+      console.warn('Maestro driver warm-up failed (non-fatal, continuing with tests)');
+    }
+
+    const results = [];
+
+    // Retry only on the known Cirrus Labs Tart VM flake where the app fails
+    // to reach "E2E Tests Ready" after a fresh launchApp. Maestro's exit code
+    // is a flat 0/1 (see TestCommand.kt), so the pattern must be detected in
+    // stdout. Real assertion failures elsewhere (e.g. assertEventIdVisible)
+    // are surfaced immediately.
+    const READY_ASSERTION_FLAKE = 'Assert that "E2E Tests Ready" is visible... FAILED';
+    const MAX_ATTEMPTS = 2;
+
+    // Run each flow in its own process to prevent crash cascade —
+    // when crash.yml kills the app, a shared Maestro session would fail
+    // all subsequent flows.
+    console.log('Waiting for flows to complete...');
+    for (const flow of flowFiles) {
+      const flowPath = path.join('maestro', flow);
+      const name = flow.replace('.yml', '');
+      let lastElapsed = 0;
+      let lastOutput = '';
+      let lastDetail = '';
+      let passed = false;
+
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        const startTime = Date.now();
+        try {
+          execFileSync('maestro', [
+            'test',
+            flowPath,
+            '--env', `APP_ID=${appId}`,
+            '--env', `SENTRY_AUTH_TOKEN=${sentryAuthToken}`,
+            '--debug-output', 'maestro-logs',
+            '--flatten-debug-output',
+          ], {
+            stdio: 'pipe',
+            cwd: e2eDir,
+          });
+          lastElapsed = Math.round((Date.now() - startTime) / 1000);
+          passed = true;
+          const suffix = attempt > 1 ? ` (attempt ${attempt}/${MAX_ATTEMPTS})` : '';
+          console.log(`[Passed] ${name} (${lastElapsed}s)${suffix}`);
+          break;
+        } catch (error) {
+          lastElapsed = Math.round((Date.now() - startTime) / 1000);
+          lastOutput = (error.stdout?.toString() || '') + (error.stderr?.toString() || '');
+          lastDetail = lastOutput.split('\n').find(l =>
+            l.includes('App crashed') || l.includes('Element not found') || l.includes('FAILED')) || '';
+
+          const isReadyFlake = lastOutput.includes(READY_ASSERTION_FLAKE);
+          const canRetry = isReadyFlake && attempt < MAX_ATTEMPTS;
+
+          if (canRetry) {
+            console.log(`[Flaky] ${name} (${lastElapsed}s)${lastDetail ? ` (${lastDetail.trim()})` : ''} — retrying (${attempt + 1}/${MAX_ATTEMPTS})`);
+            // Brief pause to let the simulator/driver settle before retrying
+            execFileSync('sleep', ['5']);
+            continue;
+          }
+          console.log(`[Failed] ${name} (${lastElapsed}s)${lastDetail ? ` (${lastDetail.trim()})` : ''}`);
+          if (lastOutput) {
+            console.log(`\n--- ${name} output ---\n${lastOutput.trim()}\n--- end ${name} output ---\n`);
+          }
+          break;
+        }
+      }
+
+      results.push({ name, passed, elapsed: lastElapsed, detail: passed ? '' : lastDetail });
+    }
+
+    const failedFlows = results.filter(r => !r.passed).map(r => r.name);
+
+    // Always redact sensitive data, even if some tests failed
+    try {
+      const logDir = path.join(e2eDir, 'maestro-logs');
+      if (fs.existsSync(logDir)) {
+        const redactFiles = (dir) => {
+          for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+              redactFiles(fullPath);
+            } else {
+              const content = fs.readFileSync(fullPath, 'utf8');
+              if (content.includes(sentryAuthToken)) {
+                fs.writeFileSync(fullPath, content.replaceAll(sentryAuthToken, '[REDACTED]'));
+              }
+            }
+          }
+        };
+        redactFiles(logDir);
+        console.log('Redacted sensitive data from logs');
+      }
+    } catch (error) {
+      console.warn('Failed to redact sensitive data from logs:', error.message);
+    }
+
+    if (failedFlows.length > 0) {
+      console.error(`\nFailed flows: ${failedFlows.join(', ')}`);
+      process.exit(1);
+    }
+  }
+}

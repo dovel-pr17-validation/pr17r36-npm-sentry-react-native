@@ -1,0 +1,213 @@
+import type { Client, Event, EventHint, Integration, StartSpanOptions } from '@sentry/core';
+
+import { instrumentOutgoingRequests } from '@sentry/browser';
+import { debug, getClient } from '@sentry/core';
+
+import { isExpoFetchEnabled, isResourceTimingSupported, isWeb } from '../utils/environment';
+import { getDevServer } from './../integrations/debugsymbolicatorutils';
+import { getTransactionEventDiscardReason } from './onSpanEndUtils';
+import { addDefaultOpForSpanFrom, addThreadInfoToSpan, defaultIdleOptions } from './span';
+
+export const INTEGRATION_NAME = 'ReactNativeTracing';
+
+export interface ReactNativeTracingOptions {
+  /**
+   * The time that has to pass without any span being created.
+   * If this time is exceeded, the idle span will finish.
+   *
+   * @default 1_000 (ms)
+   */
+  idleTimeoutMs?: number;
+
+  /**
+   * The max. time an idle span may run.
+   * If this time is exceeded, the idle span will finish no matter what.
+   *
+   * @default 60_0000 (ms)
+   */
+  finalTimeoutMs?: number;
+
+  /**
+   * Flag to disable patching all together for fetch requests.
+   *
+   * Fetch in React Native is a `whatwg-fetch` polyfill which uses XHR under the hood.
+   * This causes duplicates when both `traceFetch` and `traceXHR` are enabled at the same time.
+   *
+   * @default false
+   */
+  traceFetch: boolean;
+
+  /**
+   * Flag to disable patching all together for xhr requests.
+   *
+   * @default true
+   */
+  traceXHR: boolean;
+
+  /**
+   * If true, Sentry will capture http timings and add them to the corresponding http spans.
+   *
+   * Requires `resource` performance entries, which React Native reports since 0.83.
+   * Requests made with Expo's native fetch (`expo/fetch`) don't report them.
+   *
+   * @default true on web and on React Native 0.83+, except for `expo/fetch` requests
+   */
+  enableHTTPTimings: boolean;
+
+  /**
+   * A callback which is called before a span for a navigation is started.
+   * It receives the options passed to `startSpan`, and expects to return an updated options object.
+   */
+  beforeStartSpan?: (options: StartSpanOptions) => StartSpanOptions;
+
+  /**
+   * This function will be called before creating a span for a request with the given url.
+   * Return false if you don't want a span for the given url.
+   *
+   * @default (url: string) => true
+   */
+  shouldCreateSpanForRequest?(this: void, url: string): boolean;
+}
+
+function getDefaultTracePropagationTargets(): RegExp[] | undefined {
+  if (isWeb()) {
+    return undefined;
+  }
+  return [/.*/];
+}
+
+export const defaultReactNativeTracingOptions: ReactNativeTracingOptions = {
+  traceFetch: false,
+  traceXHR: true,
+  enableHTTPTimings: true,
+};
+
+export type ReactNativeTracingState = {
+  currentRoute: string | undefined;
+};
+
+export const reactNativeTracingIntegration = (
+  options: Partial<ReactNativeTracingOptions> = {},
+): Integration & {
+  options: ReactNativeTracingOptions;
+  state: ReactNativeTracingState;
+  setCurrentRoute: (route: string) => void;
+} => {
+  const state: ReactNativeTracingState = {
+    currentRoute: undefined,
+  };
+
+  // RN's default fetch is a `whatwg-fetch` polyfill over XHR, so tracing both causes duplicates.
+  // Expo SDK 56+ replaces fetch with a native implementation (`expo/fetch`) that bypasses XHR,
+  // so fetch tracing must be enabled for network requests to be captured.
+  // Computed here (not at module level) to ensure expo/fetch polyfill is installed before detection.
+  const traceFetchDefault = isWeb() || isExpoFetchEnabled();
+
+  // Each traced request keeps a `resource` listener until a matching timing entry arrives.
+  // Without timing entries (RN < 0.83, `expo/fetch`), listeners accumulate for the whole session.
+  const xhrHTTPTimingsDefault = isWeb() || isResourceTimingSupported();
+  const fetchHTTPTimingsDefault = isWeb() || (isResourceTimingSupported() && !isExpoFetchEnabled());
+
+  const finalOptions = {
+    ...defaultReactNativeTracingOptions,
+    traceFetch: traceFetchDefault,
+    enableHTTPTimings: xhrHTTPTimingsDefault,
+    ...options,
+    beforeStartSpan: options.beforeStartSpan ?? ((options: StartSpanOptions) => options),
+    finalTimeoutMs: options.finalTimeoutMs ?? defaultIdleOptions.finalTimeout,
+    idleTimeoutMs: options.idleTimeoutMs ?? defaultIdleOptions.idleTimeout,
+  };
+
+  const userShouldCreateSpanForRequest = finalOptions.shouldCreateSpanForRequest;
+
+  // Drop Dev Server Spans
+  const devServerUrl = getDevServer()?.url;
+  const finalShouldCreateSpanForRequest =
+    devServerUrl === undefined
+      ? userShouldCreateSpanForRequest
+      : (url: string): boolean => {
+          if (url.startsWith(devServerUrl)) {
+            return false;
+          }
+          if (userShouldCreateSpanForRequest) {
+            return userShouldCreateSpanForRequest(url);
+          }
+          return true;
+        };
+
+  finalOptions.shouldCreateSpanForRequest = finalShouldCreateSpanForRequest;
+
+  const setup = (client: Client): void => {
+    addDefaultOpForSpanFrom(client);
+    addThreadInfoToSpan(client);
+
+    const requestOptions = {
+      shouldCreateSpanForRequest: finalOptions.shouldCreateSpanForRequest,
+      tracePropagationTargets: client.getOptions().tracePropagationTargets || getDefaultTracePropagationTargets(),
+    };
+
+    // Instrumented separately so `expo/fetch` can skip HTTP timings while XHR keeps them.
+    instrumentOutgoingRequests(client, {
+      ...requestOptions,
+      traceFetch: finalOptions.traceFetch,
+      traceXHR: false,
+      enableHTTPTimings: options.enableHTTPTimings ?? fetchHTTPTimingsDefault,
+    });
+    instrumentOutgoingRequests(client, {
+      ...requestOptions,
+      traceFetch: false,
+      traceXHR: finalOptions.traceXHR,
+      enableHTTPTimings: finalOptions.enableHTTPTimings,
+    });
+  };
+
+  const processEvent = (event: Event, _hint: EventHint, _client: Client): Event | null => {
+    if (event.type === 'transaction') {
+      const discardReason = getTransactionEventDiscardReason(event);
+      if (discardReason) {
+        debug.log(`[ReactNativeTracing] Dropping transaction marked for discard (reason: ${discardReason}).`);
+        // `@sentry/core` automatically records a dropped event with reason
+        // `event_processor` when a processor returns `null`, so we don't call
+        // `recordDroppedEvent` here to avoid double-counting in client reports.
+        return null;
+      }
+    }
+
+    if (event.contexts && state.currentRoute) {
+      event.contexts.app = { view_names: [state.currentRoute], ...event.contexts.app };
+    }
+    return event;
+  };
+
+  return {
+    name: INTEGRATION_NAME,
+    setup,
+    processEvent,
+    options: finalOptions,
+    state,
+    setCurrentRoute: (route: string) => {
+      state.currentRoute = route;
+    },
+  };
+};
+
+export type ReactNativeTracingIntegration = ReturnType<typeof reactNativeTracingIntegration>;
+
+/**
+ * Returns the current React Native Tracing integration.
+ */
+export function getCurrentReactNativeTracingIntegration(): ReactNativeTracingIntegration | undefined {
+  const client = getClient();
+  if (!client) {
+    return undefined;
+  }
+
+  return getReactNativeTracingIntegration(client);
+}
+
+/**
+ * Returns React Native Tracing integration of given client.
+ */
+export function getReactNativeTracingIntegration(client: Client): ReactNativeTracingIntegration | undefined {
+  return client.getIntegrationByName(INTEGRATION_NAME);
+}

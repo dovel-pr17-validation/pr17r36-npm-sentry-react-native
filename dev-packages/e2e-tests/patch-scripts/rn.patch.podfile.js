@@ -1,0 +1,91 @@
+#!/usr/bin/env node
+
+const fs = require('fs');
+const { argv } = require('process');
+
+const parseArgs = require('minimist');
+const { debug } = require('@sentry/core');
+debug.enable();
+
+const args = parseArgs(argv.slice(2));
+if (!args['pod-file']) {
+  throw new Error('Missing --pod-file');
+}
+
+if (!args['engine']) {
+  throw new Error('Missing --engine');
+}
+
+const enableHermes = args['engine'] === 'hermes' ? true : args['engine'] === 'jsc' ? false : null;
+if (enableHermes === null) {
+  throw new Error('Invalid engine');
+}
+
+// Optional iOS version argument, defaults to '15.1' due to Cocoa SDK V9 and RN 0.81.0 requirement
+const iosVersion = args['ios-version'] || '15.1';
+
+debug.log('Patching Podfile', args['pod-file']);
+let content = fs.readFileSync(args['pod-file'], 'utf8');
+
+const isHermesEnabled = content.includes(':hermes_enabled => true,');
+const shouldPatch = enableHermes !== isHermesEnabled;
+if (shouldPatch) {
+  content = content.replace(
+    /:hermes_enabled.*/,
+    enableHermes ? ':hermes_enabled => true,' : ':hermes_enabled => false,',
+  );
+  if (enableHermes) {
+    debug.log('Patching Podfile for Hermes');
+  } else {
+    debug.log('Patching Podfile for JSC');
+  }
+}
+
+// Patch iOS version
+const platformPattern = /platform :ios, (min_ios_version_supported|['"][0-9.]+['"])/;
+const currentMatch = content.match(platformPattern);
+
+if (currentMatch) {
+  const currentValue = currentMatch[1];
+  const shouldPatchVersion = currentValue === 'min_ios_version_supported' ||
+                             currentValue !== `'${iosVersion}'`;
+
+  if (shouldPatchVersion) {
+    content = content.replace(
+      platformPattern,
+      `platform :ios, '${iosVersion}'`
+    );
+    debug.log(`Patching iOS version to ${iosVersion} (was: ${currentValue})`);
+  } else {
+    debug.log(`iOS version already set to ${iosVersion}`);
+  }
+} else {
+  debug.log('Warning: Could not find platform :ios line to patch');
+}
+
+// RNSentry now contains Swift code (via the RNSentryInternal bridge over
+// SentrySDK.internal). CocoaPods refuses to integrate a Swift pod against
+// non-modular ObjC dependencies (e.g. React-hermes on older RN versions),
+// so ensure the Podfile requests modular headers globally.
+let modularPatched = false;
+if (!content.includes('use_modular_headers!')) {
+  const patched = content.replace(
+    /prepare_react_native_project!\s*\n/,
+    'prepare_react_native_project!\nuse_modular_headers!\n',
+  );
+  if (patched !== content) {
+    content = patched;
+    modularPatched = true;
+    debug.log('Patching Podfile with use_modular_headers!');
+  } else {
+    debug.log('Warning: Could not find prepare_react_native_project! anchor to inject use_modular_headers!');
+  }
+}
+
+// Write the file if any changes were made
+if (shouldPatch || currentMatch || modularPatched) {
+  fs.writeFileSync(args['pod-file'], content);
+  debug.log('Podfile patched successfully!');
+} else {
+  debug.log('Podfile is already patched!');
+}

@@ -1,0 +1,976 @@
+import type {
+  Envelope,
+  Event,
+  Outcome,
+  SessionAggregates,
+  Transport,
+  TransportMakeRequestResponse,
+} from '@sentry/core';
+
+import { defaultStackParser } from '@sentry/browser';
+import * as SentryCore from '@sentry/core';
+import {
+  addAutoIpAddressToSession,
+  addAutoIpAddressToUser,
+  makeSession,
+  rejectedSyncPromise,
+  SentryError,
+} from '@sentry/core';
+import * as RN from 'react-native';
+
+import type { ReactNativeClientOptions } from '../src/js/options';
+
+import { ReactNativeClient } from '../src/js/client';
+import { uiProfilingIntegration } from '../src/js/profiling/uiProfilingIntegration';
+import { NativeTransport } from '../src/js/transports/native';
+import { SDK_NAME, SDK_PACKAGE_NAME, SDK_VERSION } from '../src/js/version';
+import { NATIVE } from '../src/js/wrapper';
+import {
+  createMockTransport,
+  envelopeHeader,
+  envelopeItemHeader,
+  envelopeItemPayload,
+  envelopeItems,
+  firstArg,
+  getMockSession,
+  getMockUserFeedback,
+  getSyncPromiseRejectOnFirstCall,
+} from './testutils';
+import * as mockedtimetodisplaynative from './tracing/mockedtimetodisplaynative';
+
+jest.mock('../src/js/tracing/timetodisplaynative', () => mockedtimetodisplaynative);
+
+interface MockedReactNative {
+  NativeModules: {
+    RNSentry: {
+      initNativeSdk: jest.Mock;
+      crash: jest.Mock;
+      captureEnvelope: jest.Mock;
+      captureScreenshot: jest.Mock;
+      fetchNativeAppStart: jest.Mock;
+      enableNativeFramesTracking: jest.Mock;
+    };
+  };
+  Platform: {
+    OS: 'mock';
+  };
+  LogBox: {
+    ignoreLogs: jest.Mock;
+  };
+  YellowBox: {
+    ignoreWarnings: jest.Mock;
+  };
+  Alert: {
+    alert: jest.Mock;
+  };
+}
+
+jest.mock(
+  'react-native',
+  (): MockedReactNative => ({
+    NativeModules: {
+      RNSentry: {
+        initNativeSdk: jest.fn(() => Promise.resolve(true)),
+        crash: jest.fn(),
+        captureEnvelope: jest.fn(),
+        captureScreenshot: jest.fn().mockResolvedValue(null),
+        fetchNativeAppStart: jest.fn(),
+        enableNativeFramesTracking: jest.fn(),
+      },
+    },
+    Platform: {
+      OS: 'mock',
+    },
+    LogBox: {
+      ignoreLogs: jest.fn(),
+    },
+    YellowBox: {
+      ignoreWarnings: jest.fn(),
+    },
+    Alert: {
+      alert: jest.fn(),
+    },
+  }),
+);
+
+const EXAMPLE_DSN = 'https://6890c2f6677340daa4804f8194804ea2@o19635.ingest.sentry.io/148053';
+
+const DEFAULT_OPTIONS: ReactNativeClientOptions = {
+  enableNative: true,
+  enableNativeCrashHandling: true,
+  enableNativeNagger: true,
+  autoInitializeNativeSdk: true,
+  enableAutoPerformanceTracing: true,
+  enableWatchdogTerminationTracking: true,
+  patchGlobalPromise: true,
+  integrations: [],
+  transport: () => ({
+    send: jest.fn(),
+    flush: jest.fn(),
+  }),
+  stackParser: jest.fn().mockReturnValue([]),
+};
+
+describe('Tests ReactNativeClient', () => {
+  describe('initializing the client', () => {
+    test('client initializes', async () => {
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => new NativeTransport(),
+      });
+
+      await expect(client.eventFromMessage('test')).resolves.toBeDefined();
+      await expect(RN.LogBox.ignoreLogs).not.toHaveBeenCalled();
+    });
+
+    test('invalid dsn is thrown', () => {
+      try {
+        new ReactNativeClient({
+          ...DEFAULT_OPTIONS,
+          dsn: 'not a dsn',
+          transport: () => new NativeTransport(),
+        });
+      } catch (e: any) {
+        expect(e.message).toBe('Invalid Sentry Dsn: not a dsn');
+      }
+    });
+
+    test("undefined dsn doesn't crash", () => {
+      expect(() => {
+        const backend = new ReactNativeClient({
+          ...DEFAULT_OPTIONS,
+          dsn: undefined,
+          transport: () => new NativeTransport(),
+        });
+
+        return expect(backend.eventFromMessage('test')).resolves.toBeDefined();
+      }).not.toThrow();
+    });
+
+    test('use custom transport function', async () => {
+      const mySend = (_request: Envelope): Promise<TransportMakeRequestResponse> => Promise.resolve({});
+      const myFlush = (timeout?: number) => Promise.resolve(Boolean(timeout));
+      const myCustomTransportFn = (): Transport => ({
+        send: mySend,
+        flush: myFlush,
+      });
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: myCustomTransportFn,
+      });
+      expect(client.getTransport()?.flush).toBe(myFlush);
+      expect(client.getTransport()?.send).toBe(mySend);
+    });
+  });
+
+  describe('UI profiling options', () => {
+    const profilingOptions = { profileSessionSampleRate: 1, lifecycle: 'trace' as const };
+
+    const initClient = (integrations: ReactNativeClientOptions['integrations']): ReactNativeClient => {
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        _experiments: { profilingOptions, enableUnhandledCPPExceptionsV2: true },
+        integrations,
+      } as ReactNativeClientOptions);
+      client.init();
+      return client;
+    };
+
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    test('passes profilingOptions to native when uiProfilingIntegration is installed', () => {
+      const initNativeSdk = jest.spyOn(NATIVE, 'initNativeSdk');
+
+      initClient([uiProfilingIntegration()]);
+
+      expect(initNativeSdk).toHaveBeenCalledWith(expect.objectContaining({ profilingOptions }));
+    });
+
+    test('does not pass profilingOptions to native and warns when uiProfilingIntegration is missing', () => {
+      const initNativeSdk = jest.spyOn(NATIVE, 'initNativeSdk');
+      const warn = jest.spyOn(SentryCore.debug, 'warn');
+
+      initClient([]);
+
+      const nativeOptions = initNativeSdk.mock.calls[0]?.[0];
+      expect(nativeOptions?.profilingOptions).toBeUndefined();
+      expect(nativeOptions?._experiments).toEqual({ enableUnhandledCPPExceptionsV2: true });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('`uiProfilingIntegration` is not installed'));
+    });
+  });
+
+  describe('enabled option', () => {
+    test('captureMessage does not call transport when enabled false', () => {
+      const mockTransport = createMockTransport();
+      const client = createDisabledClientWith(mockTransport);
+
+      client.captureMessage('This message will never be sent because the client is disabled.');
+
+      expect(mockTransport.send).not.toHaveBeenCalled();
+    });
+
+    test('captureException does not call transport when enabled false', () => {
+      const mockTransport = createMockTransport();
+      const client = createDisabledClientWith(mockTransport);
+
+      client.captureException(new Error('This exception will never be sent because the client is disabled.'));
+
+      expect(mockTransport.send).not.toHaveBeenCalled();
+    });
+
+    test('captureEvent does not call transport when enabled false', () => {
+      const mockTransport = createMockTransport();
+      const client = createDisabledClientWith(mockTransport);
+
+      client.captureEvent({
+        message: 'This event will never be sent because the client is disabled.',
+      });
+
+      expect(mockTransport.send).not.toHaveBeenCalled();
+    });
+
+    test('captureSession does not call transport when enabled false', () => {
+      const mockTransport = createMockTransport();
+      const client = createDisabledClientWith(mockTransport);
+
+      client.captureSession(getMockSession());
+
+      expect(mockTransport.send).not.toHaveBeenCalled();
+    });
+
+    // TODO: Replacy by Sentry.captureFeedback
+    test('captureUserFeedback does not call transport when enabled false', () => {
+      const mockTransport = createMockTransport();
+      const client = createDisabledClientWith(mockTransport);
+
+      client.captureUserFeedback(getMockUserFeedback());
+
+      expect(mockTransport.send).not.toHaveBeenCalled();
+    });
+
+    function createDisabledClientWith(transport: Transport) {
+      return new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        enabled: false,
+        transport: () => transport,
+      });
+    }
+  });
+
+  describe('onReady', () => {
+    test('calls onReady callback with true if Native SDK is initialized', done => {
+      new ReactNativeClient(
+        mockedOptions({
+          dsn: EXAMPLE_DSN,
+          enableNative: true,
+          onReady: ({ didCallNativeInit }) => {
+            expect(didCallNativeInit).toBe(true);
+
+            done();
+          },
+          transport: () => new NativeTransport(),
+        }),
+      ).init();
+    });
+
+    test('catches errors from onReady callback', () => {
+      new ReactNativeClient(
+        mockedOptions({
+          dsn: EXAMPLE_DSN,
+          enableNative: true,
+          onReady: () => {
+            throw new Error('This error should be caught by the SDK');
+          },
+          transport: () => new NativeTransport(),
+        }),
+      ).init();
+    });
+
+    test('calls onReady callback with false if Native SDK was not initialized', done => {
+      new ReactNativeClient(
+        mockedOptions({
+          dsn: EXAMPLE_DSN,
+          enableNative: false,
+          onReady: ({ didCallNativeInit }) => {
+            expect(didCallNativeInit).toBe(false);
+
+            done();
+          },
+          transport: () => new NativeTransport(),
+        }),
+      ).init();
+    });
+
+    test('calls onReady callback with false if Native SDK failed to initialize', done => {
+      const RN: MockedReactNative = require('react-native');
+
+      RN.NativeModules.RNSentry.initNativeSdk = jest.fn(() => {
+        throw new Error();
+      });
+
+      new ReactNativeClient(
+        mockedOptions({
+          dsn: EXAMPLE_DSN,
+          enableNative: true,
+          onReady: ({ didCallNativeInit }) => {
+            expect(didCallNativeInit).toBe(false);
+
+            done();
+          },
+          transport: () => new NativeTransport(),
+        }),
+      ).init();
+    });
+  });
+
+  describe('nativeCrash', () => {
+    test('calls NativeModules crash', () => {
+      NATIVE.enableNative = true;
+      const RN: MockedReactNative = require('react-native');
+
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        enableNative: true,
+        transport: () => new NativeTransport(),
+      });
+      client.nativeCrash();
+
+      expect(RN.NativeModules.RNSentry.crash).toHaveBeenCalled();
+    });
+  });
+
+  describe('UserFeedback', () => {
+    test('sends UserFeedback to native Layer', () => {
+      const mockTransportSend: jest.Mock = jest.fn(() => Promise.resolve());
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+      });
+
+      client.captureUserFeedback({
+        comments: 'Test Comments',
+        email: 'test@email.com',
+        name: 'Test User',
+        event_id: 'testEvent123',
+      });
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeHeader].event_id).toEqual('testEvent123');
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemHeader].type).toEqual(
+        'user_report',
+      );
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload]).toEqual({
+        comments: 'Test Comments',
+        email: 'test@email.com',
+        name: 'Test User',
+        event_id: 'testEvent123',
+      });
+    });
+  });
+
+  describe('attachStacktrace', () => {
+    let mockTransportSend: jest.Mock;
+    let client: ReactNativeClient;
+
+    beforeEach(() => {
+      mockTransportSend = jest.fn(() => Promise.resolve());
+    });
+
+    afterEach(() => {
+      mockTransportSend.mockClear();
+    });
+
+    const getMessageEventFrom = (func: jest.Mock) =>
+      func.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload];
+
+    test('captureMessage contains stack trace in exception', async () => {
+      client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        attachStacktrace: true,
+        stackParser: defaultStackParser,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+      } as ReactNativeClientOptions);
+
+      const mockSyntheticExceptionFromHub = new Error();
+      client.captureMessage('test message', 'error', { syntheticException: mockSyntheticExceptionFromHub });
+      expect(getMessageEventFrom(mockTransportSend).exception.values.length).toBeGreaterThan(0);
+      expect(getMessageEventFrom(mockTransportSend).exception).toBeDefined();
+      expect(getMessageEventFrom(mockTransportSend).threads).toBeUndefined();
+    });
+  });
+
+  describe('parentSpanIsAlwaysRootSpan', () => {
+    it('default is true', () => {
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+      });
+      expect(client.getOptions().parentSpanIsAlwaysRootSpan).toBe(true);
+    });
+
+    it('can be set to false', () => {
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        parentSpanIsAlwaysRootSpan: false,
+      });
+      expect(client.getOptions().parentSpanIsAlwaysRootSpan).toBe(false);
+    });
+  });
+
+  describe('envelopeHeader SdkInfo', () => {
+    let mockTransportSend: jest.Mock;
+    let client: ReactNativeClient;
+
+    beforeEach(() => {
+      mockTransportSend = jest.fn(() => Promise.resolve());
+      client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+      });
+    });
+
+    afterEach(() => {
+      mockTransportSend.mockClear();
+    });
+
+    const expectedSdkInfo = { name: SDK_NAME, version: SDK_VERSION };
+    const getSdkInfoFrom = (func: jest.Mock) => func.mock.calls[0][firstArg][envelopeHeader].sdk;
+
+    test('send SdkInfo in the message envelope header', () => {
+      client.captureMessage('message_test_value');
+      expect(getSdkInfoFrom(mockTransportSend)).toStrictEqual(expectedSdkInfo);
+    });
+
+    test('send SdkInfo in the exception envelope header', () => {
+      client.captureException(new Error());
+      expect(getSdkInfoFrom(mockTransportSend)).toStrictEqual(expectedSdkInfo);
+    });
+
+    test('send SdkInfo in the event envelope header', () => {
+      client.captureEvent({});
+      expect(getSdkInfoFrom(mockTransportSend)).toStrictEqual(expectedSdkInfo);
+    });
+
+    test('send SdkInfo in the session envelope header', () => {
+      client.captureSession(getMockSession());
+      expect(getSdkInfoFrom(mockTransportSend)).toStrictEqual(expectedSdkInfo);
+    });
+
+    test('send SdkInfo in the user feedback envelope header', () => {
+      client.captureUserFeedback(getMockUserFeedback());
+      expect(getSdkInfoFrom(mockTransportSend)).toStrictEqual(expectedSdkInfo);
+    });
+  });
+
+  describe('event data enhancement', () => {
+    test('event contains sdk default information', async () => {
+      const mockedSend = jest.fn<PromiseLike<TransportMakeRequestResponse>, [Envelope]>().mockResolvedValue({});
+      const mockedTransport = (): Transport => ({
+        send: mockedSend,
+        flush: jest.fn().mockResolvedValue(true),
+      });
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: mockedTransport,
+      });
+
+      client.captureEvent({ message: 'test event' });
+
+      expect(mockedSend).toHaveBeenCalled();
+      const actualEvent: Event | undefined = <Event>(
+        mockedSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload]
+      );
+      expect(actualEvent?.sdk?.packages).toEqual([
+        {
+          name: SDK_PACKAGE_NAME,
+          version: SDK_VERSION,
+        },
+      ]);
+    });
+  });
+
+  describe('normalizes events', () => {
+    test('handles circular input', async () => {
+      const mockedSend = jest.fn<PromiseLike<TransportMakeRequestResponse>, [Envelope]>().mockResolvedValue({});
+      const mockedTransport = (): Transport => ({
+        send: mockedSend,
+        flush: jest.fn().mockResolvedValue(true),
+      });
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: mockedTransport,
+      });
+      const circularEvent = {
+        extra: {
+          circular: {},
+        },
+      };
+      circularEvent.extra.circular = circularEvent;
+
+      client.captureEvent(circularEvent);
+
+      expect(mockedSend).toHaveBeenCalled();
+      const actualEvent: Event | undefined = <Event>(
+        mockedSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload]
+      );
+      expect(actualEvent?.extra).toEqual({
+        circular: {
+          extra: '[Circular ~]',
+        },
+      });
+    });
+  });
+
+  describe('clientReports', () => {
+    test('does not send client reports if disabled', () => {
+      const mockTransportSend = jest.fn<PromiseLike<TransportMakeRequestResponse>, [Envelope]>().mockResolvedValue({});
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendClientReports: false,
+      });
+
+      mockDroppedEvent(client);
+
+      client.captureMessage('message_test_value');
+
+      expectOnlyMessageEventInEnvelope(mockTransportSend);
+    });
+
+    test('send client reports on event envelope', () => {
+      const mockTransportSend = jest.fn<PromiseLike<TransportMakeRequestResponse>, [Envelope]>().mockResolvedValue({});
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendClientReports: true,
+      });
+
+      mockDroppedEvent(client);
+
+      client.captureMessage('message_test_value');
+
+      expect(mockTransportSend).toHaveBeenCalledTimes(1);
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][1][envelopeItemHeader]).toEqual({
+        type: 'client_report',
+      });
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][1][envelopeItemPayload]).toEqual(
+        expect.objectContaining({
+          discarded_events: [
+            {
+              reason: 'before_send',
+              category: 'error',
+              quantity: 1,
+            },
+          ],
+        }),
+      );
+      expect((client as unknown as { _outcomesBuffer: Outcome[] })._outcomesBuffer).toEqual(<Outcome[]>[]);
+    });
+
+    test('does not send empty client report', () => {
+      const mockTransportSend = jest.fn<PromiseLike<TransportMakeRequestResponse>, [Envelope]>().mockResolvedValue({});
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendClientReports: true,
+      });
+
+      client.captureMessage('message_test_value');
+
+      expectOnlyMessageEventInEnvelope(mockTransportSend);
+    });
+
+    test('keeps outcomes in case envelope fails to send', () => {
+      const mockTransportSend = jest.fn((_envelope: Envelope) => rejectedSyncPromise(new SentryError('Test')));
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendClientReports: true,
+      });
+
+      mockDroppedEvent(client);
+
+      client.captureMessage('message_test_value');
+
+      expect((client as unknown as { _outcomesBuffer: Outcome[] })._outcomesBuffer).toEqual(<Outcome[]>[
+        { reason: 'before_send', category: 'error', quantity: 1 },
+      ]);
+    });
+
+    test('sends buffered client reports on second try', () => {
+      const mockTransportSend = getSyncPromiseRejectOnFirstCall<[Envelope]>(new SentryError('Test'));
+      const client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendClientReports: true,
+      });
+
+      mockDroppedEvent(client);
+      client.captureMessage('message_test_value_1');
+      mockDroppedEvent(client);
+      client.captureMessage('message_test_value_2');
+
+      expect(mockTransportSend).toHaveBeenCalledTimes(2);
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems].length).toEqual(2);
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][1][envelopeItemHeader]).toEqual({
+        type: 'client_report',
+      });
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][1][envelopeItemPayload]).toEqual(
+        expect.objectContaining({
+          discarded_events: [
+            {
+              reason: 'before_send',
+              category: 'error',
+              quantity: 2,
+            },
+          ],
+        }),
+      );
+      expect((client as unknown as { _outcomesBuffer: Outcome[] })._outcomesBuffer).toEqual(<Outcome[]>[]);
+    });
+
+    function expectOnlyMessageEventInEnvelope(transportSend: jest.Mock) {
+      expect(transportSend).toHaveBeenCalledTimes(1);
+      expect(transportSend.mock.calls[0][firstArg][envelopeItems]).toHaveLength(1);
+      expect(transportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemHeader]).toEqual(
+        expect.objectContaining({ type: 'event' }),
+      );
+    }
+
+    function mockDroppedEvent(client: ReactNativeClient) {
+      client.recordDroppedEvent('before_send', 'error');
+    }
+  });
+
+  describe('ipAddress', () => {
+    let mockTransportSend: jest.Mock;
+    let client: ReactNativeClient;
+
+    beforeEach(() => {
+      mockTransportSend = jest.fn(() => Promise.resolve());
+      client = new ReactNativeClient({
+        ...DEFAULT_OPTIONS,
+        dsn: EXAMPLE_DSN,
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendDefaultPii: true,
+      });
+    });
+
+    test('preserves ip_address null', () => {
+      client.captureEvent({
+        user: {
+          ip_address: null,
+        },
+      });
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].user).toEqual(
+        expect.objectContaining({ ip_address: null }),
+      );
+    });
+
+    test('preserves ip_address value if set', () => {
+      client.captureEvent({
+        user: {
+          ip_address: '203.45.167.89',
+        },
+      });
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].user).toEqual(
+        expect.objectContaining({ ip_address: '203.45.167.89' }),
+      );
+    });
+
+    test("doesn't change infer_ip if the ip_address is set to undefined", () => {
+      client.captureEvent({
+        user: {
+          ip_address: undefined,
+        },
+      });
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].user).toEqual(
+        expect.objectContaining({ ip_address: undefined }),
+      );
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].sdk).toEqual(
+        expect.objectContaining({
+          settings: {
+            infer_ip: 'auto',
+          },
+        }),
+      );
+    });
+
+    test("doesn't change infer_ip if the user is not set", () => {
+      client.captureEvent({
+        user: {},
+      });
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].user).toBeEmptyObject();
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].sdk).toEqual(
+        expect.objectContaining({
+          settings: {
+            infer_ip: 'auto',
+          },
+        }),
+      );
+    });
+
+    test("doesn't change infer_ip if the event is empty", () => {
+      client.captureEvent({});
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].user).toBeUndefined();
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].sdk).toEqual(
+        expect.objectContaining({
+          settings: {
+            infer_ip: 'auto',
+          },
+        }),
+      );
+    });
+
+    test('does not add ip_address {{auto}} to undefined user if sendDefaultPii is false', () => {
+      const { client, onSpy } = createClientWithSpy({
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendDefaultPii: false,
+      });
+
+      client.captureEvent({});
+
+      expect(onSpy).not.toHaveBeenCalledWith('postprocessEvent', addAutoIpAddressToUser);
+      expect(
+        mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].user?.ip_address,
+      ).toBeUndefined();
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].sdk).toEqual(
+        expect.objectContaining({
+          settings: {
+            infer_ip: 'never',
+          },
+        }),
+      );
+    });
+
+    test('does not add ip_address {{auto}} to session if sendDefaultPii is false', () => {
+      const { client, onSpy } = createClientWithSpy({
+        release: 'test', // required for sessions to be sent
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendDefaultPii: false,
+      });
+
+      const session = makeSession();
+      session.ipAddress = undefined;
+      client.captureSession(session);
+
+      expect(onSpy).not.toHaveBeenCalledWith('beforeSendSession', addAutoIpAddressToSession);
+      expect(
+        mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].attrs.ip_address,
+      ).toBeUndefined();
+    });
+
+    test('does not add ip_address {{auto}} to session aggregate if sendDefaultPii is false', () => {
+      const { client, onSpy } = createClientWithSpy({
+        release: 'test', // required for sessions to be sent
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendDefaultPii: false,
+      });
+
+      const session: SessionAggregates = {
+        aggregates: [],
+      };
+      client.sendSession(session);
+
+      expect(onSpy).not.toHaveBeenCalledWith('beforeSendSession', addAutoIpAddressToSession);
+      expect(
+        mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].attrs.ip_address,
+      ).toBeUndefined();
+    });
+
+    test('does not overwrite session aggregate ip_address if already set', () => {
+      const { client } = createClientWithSpy({
+        release: 'test', // required for sessions to be sent
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendDefaultPii: true,
+      });
+
+      const session: SessionAggregates = {
+        aggregates: [],
+        attrs: {
+          ip_address: '123.45.67.89',
+        },
+      };
+      client.sendSession(session);
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].attrs.ip_address).toBe(
+        '123.45.67.89',
+      );
+    });
+
+    test('does add ip_address {{auto}} to session if sendDefaultPii is true', () => {
+      const { client } = createClientWithSpy({
+        release: 'test', // required for sessions to be sent
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendDefaultPii: true,
+      });
+
+      const session = makeSession();
+      session.ipAddress = undefined;
+      client.captureSession(session);
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].attrs.ip_address).toBe(
+        '{{auto}}',
+      );
+    });
+
+    test('does not overwrite session  ip_address if already set', () => {
+      const { client } = createClientWithSpy({
+        release: 'test', // required for sessions to be sent
+        transport: () => ({
+          send: mockTransportSend,
+          flush: jest.fn(),
+        }),
+        sendDefaultPii: true,
+      });
+
+      const session = makeSession();
+      session.ipAddress = '123.45.67.89';
+      client.captureSession(session);
+
+      expect(mockTransportSend.mock.calls[0][firstArg][envelopeItems][0][envelopeItemPayload].attrs.ip_address).toBe(
+        '123.45.67.89',
+      );
+    });
+  });
+
+  describe('logger initialization', () => {
+    afterEach(() => {
+      jest.useRealTimers();
+      jest.restoreAllMocks();
+    });
+
+    test('does not flush logs when enableLogs is false', () => {
+      jest.useFakeTimers();
+      const flushLogsSpy = jest.spyOn(SentryCore, '_INTERNAL_flushLogsBuffer').mockImplementation(jest.fn());
+
+      const { client } = createClientWithSpy({ enableLogs: false });
+
+      client.emit('afterCaptureLog', { message: 'test', attributes: {} } as unknown);
+      jest.advanceTimersByTime(5000);
+
+      expect(flushLogsSpy).not.toHaveBeenCalled();
+    });
+
+    test('does not flush logs when logsOrigin is native', () => {
+      jest.useFakeTimers();
+      const flushLogsSpy = jest.spyOn(SentryCore, '_INTERNAL_flushLogsBuffer').mockImplementation(jest.fn());
+
+      const { client } = createClientWithSpy({ enableLogs: true, logsOrigin: 'native' });
+
+      client.emit('afterCaptureLog', { message: 'test', attributes: {} } as unknown);
+      jest.advanceTimersByTime(5000);
+
+      expect(flushLogsSpy).not.toHaveBeenCalled();
+    });
+
+    it.each([['all' as const], ['js' as const]])('flushes logs when logsOrigin is %s', logOrlogsOriginigin => {
+      jest.useFakeTimers();
+      const flushLogsSpy = jest.spyOn(SentryCore, '_INTERNAL_flushLogsBuffer').mockImplementation(jest.fn());
+
+      const { client } = createClientWithSpy({ enableLogs: true, logsOrigin: logOrlogsOriginigin });
+
+      client.emit('afterCaptureLog', { message: 'test', attributes: {} } as unknown);
+      jest.advanceTimersByTime(5000);
+
+      expect(flushLogsSpy).toHaveBeenCalledTimes(1);
+      expect(flushLogsSpy).toHaveBeenLastCalledWith(client);
+    });
+  });
+});
+
+function mockedOptions(options: Partial<ReactNativeClientOptions>): ReactNativeClientOptions {
+  return {
+    integrations: [],
+    stackParser: jest.fn().mockReturnValue([]),
+    transport: () => ({
+      send: jest.fn(),
+      flush: jest.fn(),
+    }),
+    ...options,
+  };
+}
+
+function createClientWithSpy(options: Partial<ReactNativeClientOptions>) {
+  const onSpy = jest.fn();
+  class SpyClient extends ReactNativeClient {
+    public on(hook: string, callback: unknown): () => void {
+      onSpy(hook, callback);
+      // @ts-expect-error - the public interface doesn't allow string and unknown
+      return super.on(hook, callback);
+    }
+  }
+
+  return {
+    client: new SpyClient({
+      ...DEFAULT_OPTIONS,
+      dsn: EXAMPLE_DSN,
+      ...options,
+    }),
+    onSpy,
+  };
+}

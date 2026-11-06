@@ -1,0 +1,67 @@
+{
+  "name": "sentry-react-native-expo-sample",
+  "version": "8.34.0",
+  "main": "expo-router/entry",
+  "scripts": {
+    "start": "expo start",
+    "start:android": "expo start --android",
+    "start:ios": "expo start --ios",
+    "start:web": "expo start --web",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "ts:check": "tsc",
+    "lint": "npx oxlint",
+    "fix": "npx oxlint --fix && npx oxfmt \"**/*.{js,jsx,ts,tsx}\"",
+    "export": "expo export --source-maps --clear --platform all",
+    "export:web": "expo export --source-maps --clear --platform web",
+    "prebuild": "expo prebuild --clean --no-install",
+    "set-version": "npx react-native-version --skip-tag --never-amend",
+    "eas-build-pre-install": "npm i -g corepack && yarn install --no-immutable --inline-builds && yarn workspace @sentry/react-native build",
+    "eas-build-on-complete": "sentry-eas-build-on-complete",
+    "eas-update-configure": "eas update:configure",
+    "eas-update-publish-development": "eas update --channel development --message 'Development update'",
+    "eas-build-development-android": "eas build --profile development --platform android"
+  },
+  "dependencies": {
+    "@sentry/core": "10.78.0",
+    "@sentry/react-native": "8.34.0",
+    "@types/react": "~19.3.0",
+    "expo": "^58.0.14",
+    "expo-constants": "~58.0.12",
+    "expo-dev-client": "~58.0.14",
+    "expo-image-picker": "~58.0.10",
+    "expo-linking": "~58.0.13",
+    "expo-router": "~58.0.23",
+    "expo-status-bar": "~58.0.3",
+    "expo-updates": "~58.0.17",
+    "expo-web-browser": "~58.0.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "react-native": "0.88.0",
+    "react-native-gesture-handler": "~3.3.0",
+    "react-native-safe-area-context": "~5.10.1",
+    "react-native-screens": "~4.30.0",
+    "react-native-web": "~0.21.4",
+    "typescript": "~6.0.3"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.26.0",
+    "@babel/preset-env": "^7.26.0",
+    "@sentry/bundler-plugins": "10.78.0",
+    "@types/node": "20.10.4",
+    "sentry-react-native-samples-utils": "workspace:^"
+  },
+  "expo": {
+    "install": {
+      "exclude": [
+        "@sentry/react-native"
+      ]
+    },
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "listUnknownPackages": false
+      }
+    }
+  },
+  "private": true
+}

@@ -1,0 +1,27 @@
+{
+  "extends": "./node_modules/@sentry/typescript/tsconfig.json",
+  "include": ["./src/js/tools/**/*.ts"],
+  "exclude": ["node_modules"],
+  "compilerOptions": {
+    "baseUrl": ".",
+    // @sentry/typescript@10.59.0 base config sets `moduleResolution: bundler`, which is
+    // incompatible with `module: CommonJS` below. Pin classic node resolution.
+    "moduleResolution": "node",
+    "paths": {
+      "metro": ["./node_modules/metro/src/index"],
+      // `@sentry/bundler-plugins` exposes the component-annotate plugin via the `./babel-plugin`
+      // subpath export, which classic `node` resolution can't follow. Point directly at its types.
+      "@sentry/bundler-plugins/babel-plugin": [
+        "./node_modules/@sentry/bundler-plugins/build/types/babel-plugin/index.d.ts"
+      ]
+    },
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": ["es7"],
+    "types": ["node"],
+    "target": "es2018",
+    "module": "CommonJS",
+    "skipLibCheck": true,
+    "importHelpers": false
+  }
+}

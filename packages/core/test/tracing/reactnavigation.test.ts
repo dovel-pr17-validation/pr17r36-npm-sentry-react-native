@@ -1,0 +1,2654 @@
+import type { Event, Measurements, SentrySpan, StartSpanOptions } from '@sentry/core';
+
+import * as core from '@sentry/core';
+import {
+  getActiveSpan,
+  getCurrentScope,
+  getGlobalScope,
+  getIsolationScope,
+  setCurrentClient,
+  spanToJSON,
+} from '@sentry/core';
+
+import type { NavigationRoute } from '../../src/js/tracing/reactnavigation';
+import type { UnsafeAction } from '../../src/js/vendor/react-navigation/types';
+
+import { nativeFramesIntegration, reactNativeTracingIntegration } from '../../src/js';
+import { SPAN_ORIGIN_AUTO_NAVIGATION_REACT_NAVIGATION } from '../../src/js/tracing/origin';
+import { clearPendingDeepLink, setPendingDeepLink } from '../../src/js/tracing/pendingDeepLink';
+import {
+  clearPendingExpoRouterNavigation,
+  setPendingExpoRouterNavigation,
+} from '../../src/js/tracing/pendingExpoRouterNavigation';
+import { extractDynamicRouteParams, reactNavigationIntegration } from '../../src/js/tracing/reactnavigation';
+import {
+  SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_KEY,
+  SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME,
+  SEMANTIC_ATTRIBUTE_ROUTE_HAS_BEEN_SEEN,
+  SEMANTIC_ATTRIBUTE_ROUTE_KEY,
+  SEMANTIC_ATTRIBUTE_ROUTE_NAME,
+  SEMANTIC_ATTRIBUTE_SENTRY_IDLE_SPAN_FINISH_REASON,
+  SEMANTIC_ATTRIBUTE_SENTRY_OP,
+  SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
+  SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE,
+  SEMANTIC_ATTRIBUTE_SENTRY_SOURCE,
+} from '../../src/js/tracing/semanticAttributes';
+import { DEFAULT_NAVIGATION_SPAN_NAME, SPAN_THREAD_NAME, SPAN_THREAD_NAME_JAVASCRIPT } from '../../src/js/tracing/span';
+import { RN_GLOBAL_OBJ } from '../../src/js/utils/worldwide';
+import { mockAppRegistryIntegration } from '../mocks/appRegistryIntegrationMock';
+import { getDefaultTestClientOptions, TestClient } from '../mocks/client';
+import { NATIVE } from '../mockWrapper';
+import { getDevServer } from './../../src/js/integrations/debugsymbolicatorutils';
+import { createMockNavigationAndAttachTo, createMockNavigationWithNestedState } from './reactnavigationutils';
+
+const dummyRoute = {
+  name: 'Route',
+  key: '0',
+};
+
+jest.mock('../../src/js/wrapper.ts', () => jest.requireActual('../mockWrapper.ts'));
+jest.mock('./../../src/js/integrations/debugsymbolicatorutils', () => ({
+  getDevServer: jest.fn(),
+}));
+jest.useFakeTimers({
+  advanceTimers: true,
+  doNotFake: ['performance'], // Keep real performance API
+});
+
+class MockNavigationContainer {
+  currentRoute: NavigationRoute | undefined = dummyRoute;
+  listeners: Record<string, (e: any) => void> = {};
+  addListener: any = jest.fn((eventType: string, listener: (e: any) => void): void => {
+    this.listeners[eventType] = listener;
+  });
+  getCurrentRoute(): NavigationRoute | undefined {
+    return this.currentRoute;
+  }
+}
+
+describe('extractDynamicRouteParams', () => {
+  it('returns undefined when params is undefined', () => {
+    expect(extractDynamicRouteParams('profile/[id]', undefined)).toBeUndefined();
+  });
+
+  it('returns undefined when route name has no dynamic segments', () => {
+    expect(extractDynamicRouteParams('StaticScreen', { foo: 'bar' })).toBeUndefined();
+  });
+
+  it('extracts single dynamic segment [id]', () => {
+    expect(extractDynamicRouteParams('profile/[id]', { id: '123' })).toEqual({
+      'route.params.id': '123',
+    });
+  });
+
+  it('extracts catch-all segment [...slug] and joins array values with /', () => {
+    expect(extractDynamicRouteParams('posts/[...slug]', { slug: ['tech', 'react-native'] })).toEqual({
+      'route.params.slug': 'tech/react-native',
+    });
+  });
+
+  it('extracts multiple dynamic segments', () => {
+    expect(
+      extractDynamicRouteParams('[org]/[project]/issues/[id]', { org: 'sentry', project: 'react-native', id: '42' }),
+    ).toEqual({
+      'route.params.org': 'sentry',
+      'route.params.project': 'react-native',
+      'route.params.id': '42',
+    });
+  });
+
+  it('ignores params not matching dynamic segments', () => {
+    expect(extractDynamicRouteParams('profile/[id]', { id: '123', utm_source: 'email' })).toEqual({
+      'route.params.id': '123',
+    });
+  });
+
+  it('returns undefined when dynamic segment key is missing from params', () => {
+    expect(extractDynamicRouteParams('profile/[id]', { name: 'test' })).toBeUndefined();
+  });
+
+  it('converts non-string param values to strings', () => {
+    expect(extractDynamicRouteParams('items/[count]', { count: 42 })).toEqual({
+      'route.params.count': '42',
+    });
+  });
+});
+
+describe('ReactNavigationInstrumentation', () => {
+  let client: TestClient;
+  let mockNavigation: ReturnType<typeof createMockNavigationAndAttachTo>;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    RN_GLOBAL_OBJ.__sentry_rn_v5_registered = false;
+
+    getCurrentScope().clear();
+    getIsolationScope().clear();
+    getGlobalScope().clear();
+  });
+
+  test('transaction set on initialize', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    await client.flush();
+
+    const actualEvent = client.event;
+    expect(actualEvent).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'Initial Screen',
+        contexts: expect.objectContaining({
+          trace: expect.objectContaining({
+            data: {
+              [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'Initial Screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_KEY]: 'initial_screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_HAS_BEEN_SEEN]: false,
+              [SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN]: SPAN_ORIGIN_AUTO_NAVIGATION_REACT_NAVIGATION,
+              [SEMANTIC_ATTRIBUTE_SENTRY_SOURCE]: 'component',
+              [SEMANTIC_ATTRIBUTE_SENTRY_OP]: 'navigation',
+              [SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE]: 1,
+              [SEMANTIC_ATTRIBUTE_SENTRY_IDLE_SPAN_FINISH_REASON]: 'idleTimeout',
+              [SPAN_THREAD_NAME]: SPAN_THREAD_NAME_JAVASCRIPT,
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  describe('initial navigation span is created after all integrations are setup', () => {
+    let reactNavigation: ReturnType<typeof reactNavigationIntegration>;
+
+    beforeEach(() => {
+      const startFrames = {
+        totalFrames: 100,
+        slowFrames: 20,
+        frozenFrames: 5,
+      };
+      const finishFrames = {
+        totalFrames: 200,
+        slowFrames: 40,
+        frozenFrames: 10,
+      };
+      NATIVE.fetchNativeFrames.mockResolvedValueOnce(startFrames).mockResolvedValueOnce(finishFrames);
+
+      reactNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+      });
+      mockNavigation = createMockNavigationAndAttachTo(reactNavigation);
+    });
+
+    test('initial navigation span contains native frames when nativeFrames integration is after react native tracing', async () => {
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: true,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [reactNavigation, nativeFramesIntegration()],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      // Flush the init transaction, must be async to allow for the native start frames to be fetched
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expectInitNavigationSpanWithNativeFrames(client.event);
+    });
+
+    test('initial navigation span contains native frames when nativeFrames integration is before react native tracing', async () => {
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: true,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [nativeFramesIntegration(), reactNavigation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      // Flush the init transaction, must be async to allow for the native start frames to be fetched
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expectInitNavigationSpanWithNativeFrames(client.event);
+    });
+
+    function expectInitNavigationSpanWithNativeFrames(event: Event): void {
+      expect(event).toEqual(
+        expect.objectContaining<Event>({
+          type: 'transaction',
+          transaction: 'Initial Screen',
+          measurements: expect.objectContaining<Measurements>({
+            frames_total: expect.toBeObject(),
+            frames_slow: expect.toBeObject(),
+            frames_frozen: expect.toBeObject(),
+          }),
+        }),
+      );
+    }
+  });
+
+  test('transaction sent on navigation', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.navigateToNewScreen();
+    jest.runOnlyPendingTimers(); // Flush the navigation transaction
+
+    await client.flush();
+
+    const actualEvent = client.event;
+    expect(actualEvent).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'New Screen',
+        contexts: expect.objectContaining({
+          trace: expect.objectContaining({
+            data: {
+              [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'New Screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_KEY]: 'new_screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_HAS_BEEN_SEEN]: false,
+              [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]: 'Initial Screen',
+              [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_KEY]: 'initial_screen',
+              [SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN]: SPAN_ORIGIN_AUTO_NAVIGATION_REACT_NAVIGATION,
+              [SEMANTIC_ATTRIBUTE_SENTRY_SOURCE]: 'component',
+              [SEMANTIC_ATTRIBUTE_SENTRY_OP]: 'navigation',
+              [SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE]: 1,
+              [SEMANTIC_ATTRIBUTE_SENTRY_IDLE_SPAN_FINISH_REASON]: 'idleTimeout',
+              [SPAN_THREAD_NAME]: SPAN_THREAD_NAME_JAVASCRIPT,
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  test('transaction sent on navigation started through _startIdleNavigationSpan', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.navigateToNewScreenWithoutUnsafeAction();
+    jest.runOnlyPendingTimers(); // Flush the navigation transaction
+
+    await client.flush();
+
+    expect(client.event).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'New Screen',
+        contexts: expect.objectContaining({
+          trace: expect.objectContaining({
+            data: expect.objectContaining({
+              [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'New Screen',
+              [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]: 'Initial Screen',
+              [SEMANTIC_ATTRIBUTE_SENTRY_OP]: 'navigation',
+            }),
+          }),
+        }),
+      }),
+    );
+  });
+
+  describe('pendingExpoRouterNavigation hand-off', () => {
+    afterEach(() => {
+      clearPendingExpoRouterNavigation();
+    });
+
+    test('tags the next navigation transaction with `navigation.method` from the pending Expo Router call', async () => {
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      setPendingExpoRouterNavigation({ method: 'push' });
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers(); // Flush the navigation transaction
+
+      await client.flush();
+
+      const data = client.event?.contexts?.trace?.data ?? {};
+      expect(data['navigation.method']).toBe('push');
+    });
+
+    test('consumes the pending value exactly once and does not leak into the following navigation', async () => {
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      setPendingExpoRouterNavigation({ method: 'replace' });
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+      expect(client.event?.contexts?.trace?.data?.['navigation.method']).toBe('replace');
+
+      // Next navigation without a pending value — must not carry over the previous method.
+      mockNavigation.navigateToSecondScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+      expect(client.event?.contexts?.trace?.data?.['navigation.method']).toBeUndefined();
+    });
+
+    test('does not set `navigation.method` when no Expo Router call is pending', async () => {
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      expect(client.event?.contexts?.trace?.data?.['navigation.method']).toBeUndefined();
+    });
+
+    test('deep-link hand-off | attaches trigger + sanitized URL on warm open', async () => {
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      setPendingDeepLink('myapp://profile/123?token=secret', 'warm-open');
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const data = client.event?.contexts?.trace?.data ?? {};
+      expect(data['navigation.trigger']).toBe('deeplink');
+      // sendDefaultPii defaults to false → query stripped, numeric id replaced.
+      expect(data['deeplink.url']).toBe('myapp://profile/<id>');
+      expect(typeof data['deeplink.dispatch_delay_ms']).toBe('number');
+      expect(data['deeplink.dispatch_delay_ms']).toBeGreaterThanOrEqual(0);
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | keeps raw URL when sendDefaultPii is enabled', async () => {
+      setupTestClient({ sendDefaultPii: true });
+      jest.runOnlyPendingTimers();
+
+      setPendingDeepLink('myapp://profile/123?token=secret', 'warm-open');
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event?.contexts?.trace?.data?.['deeplink.url']).toBe('myapp://profile/123?token=secret');
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | does not attach when no deep link is pending', async () => {
+      setupTestClient();
+      jest.runOnlyPendingTimers();
+
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const data = client.event?.contexts?.trace?.data ?? {};
+      expect(data['navigation.trigger']).toBeUndefined();
+      expect(data['deeplink.url']).toBeUndefined();
+    });
+
+    test('deep-link hand-off | drops a deep link older than routeChangeTimeoutMs', async () => {
+      setupTestClient();
+      jest.runOnlyPendingTimers();
+
+      // Forge an expired pending value (routeChangeTimeoutMs defaults to 1000ms).
+      const originalNow = Date.now;
+      const baseNow = originalNow();
+      Date.now = (): number => baseNow;
+      setPendingDeepLink('myapp://stale', 'warm-open');
+      Date.now = (): number => baseNow + 5_000;
+
+      try {
+        mockNavigation.navigateToNewScreen();
+        jest.runOnlyPendingTimers();
+        await client.flush();
+
+        expect(client.event?.contexts?.trace?.data?.['navigation.trigger']).toBeUndefined();
+      } finally {
+        Date.now = originalNow;
+        clearPendingDeepLink();
+      }
+    });
+
+    test('deep-link hand-off | cold-start late arrival tags the initial finalized nav span while still recording', async () => {
+      // Reproduces Cursor bugbot's "late deep link never tags span" finding
+      // for the Expo Router cold-start case: Expo Router auto-handles
+      // `Linking.getInitialURL()` and the initial route mounts BEFORE our
+      // integration's own `getInitialURL()` chain resolves. The synchronous
+      // listener must attribute the link to the just-mounted-but-still-
+      // recording initial nav span.
+      setupTestClient();
+      // Do NOT flush the init transaction — we want the initial nav span to
+      // still be inside its idle window when the cold-start link arrives.
+
+      // Simulate the initial route mount (Expo Router would do this on
+      // container mount, before our deeplink integration sees the URL).
+      mockNavigation.finishAppStartNavigation();
+
+      // Cold-start link arrives LATE.
+      setPendingDeepLink('myapp://profile/123', 'cold-start');
+
+      jest.runOnlyPendingTimers(); // Flush the transaction.
+      await client.flush();
+
+      const data = client.event?.contexts?.trace?.data ?? {};
+      expect(data['navigation.trigger']).toBe('deeplink');
+      expect(data['deeplink.url']).toBe('myapp://profile/<id>');
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | warm-open never tags an unrelated in-flight span (dispatched but not yet finalized)', async () => {
+      // Reproduces Cursor bugbot's "warm-open tags unrelated in-flight span"
+      // finding. If the user has just dispatched an unrelated navigation
+      // (state change pending) and a warm-open link arrives before the link
+      // handler has run, the listener must NOT attach the link to the
+      // in-flight span — it belongs to the (yet-to-be-dispatched)
+      // link-triggered navigation that follows.
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction.
+
+      // Unrelated dispatch — `latestNavigationSpan` is now set, state change
+      // has not fired yet.
+      mockNavigation.emitNavigationWithoutStateChange();
+
+      // Warm-open link arrives mid-flight.
+      setPendingDeepLink('myapp://profile/789', 'warm-open');
+
+      // The unrelated dispatch finalizes (different route, not the link's).
+      mockNavigation.completeStateChangeToNewScreen();
+      // The actual link-triggered navigation follows.
+      mockNavigation.navigateToSecondScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      // The unrelated nav must NOT carry the deeplink trigger.
+      const newScreen = client.eventQueue.find(e => e.transaction === 'New Screen');
+      expect(newScreen?.contexts?.trace?.data?.['navigation.trigger']).toBeUndefined();
+      // The link-triggered nav must carry it.
+      const secondScreen = client.eventQueue.find(e => e.transaction === 'Second Screen');
+      expect(secondScreen?.contexts?.trace?.data?.['navigation.trigger']).toBe('deeplink');
+      expect(secondScreen?.contexts?.trace?.data?.['deeplink.url']).toBe('myapp://profile/<id>');
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | warm-open never tags the previous navigation span', async () => {
+      // Reproduces Warden bot's "warm-open deep link can be consumed by a
+      // stale prior navigation span" finding. A warm-open link must NEVER
+      // attach to an already-finalized previous navigation — even if that
+      // span is still inside its idle window. It must wait in the pending
+      // slot for the navigation it actually triggers.
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction.
+
+      // User navigates to screen A. State change finalizes the span, but it
+      // keeps recording until idle timeout.
+      mockNavigation.navigateToNewScreen();
+
+      // Warm-open link arrives WHILE spanA is still recording.
+      setPendingDeepLink('myapp://profile/456', 'warm-open');
+
+      // The next dispatch is the navigation actually triggered by the link.
+      // Done synchronously so the staleness-window timer does not advance
+      // fake `Date.now()` past `routeChangeTimeoutMs`.
+      mockNavigation.navigateToSecondScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      // spanB (the link-triggered navigation) gets the deeplink attributes.
+      const spanBEvent = client.eventQueue.find(e => e.transaction === 'Second Screen');
+      expect(spanBEvent?.contexts?.trace?.data?.['navigation.trigger']).toBe('deeplink');
+      expect(spanBEvent?.contexts?.trace?.data?.['deeplink.url']).toBe('myapp://profile/<id>');
+
+      // spanA (the *previous* navigation, still recording when the link
+      // arrived) MUST NOT carry the deeplink trigger.
+      const spanAEvent = client.eventQueue.find(e => e.transaction === 'New Screen');
+      expect(spanAEvent?.contexts?.trace?.data?.['navigation.trigger']).toBeUndefined();
+      expect(spanAEvent?.contexts?.trace?.data?.['deeplink.url']).toBeUndefined();
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | second link while a span is already tagged falls through to the pending slot', async () => {
+      // Reproduces Cursor bugbot's "late listener drops subsequent URLs"
+      // finding. If `tagSpanWithDeepLink` skips tagging (span already tagged),
+      // the listener must return false so the URL is stored for the next nav
+      // rather than being silently dropped.
+      setupTestClient();
+      // Do NOT flush — keep the initial span recording.
+
+      mockNavigation.finishAppStartNavigation();
+      setPendingDeepLink('myapp://first', 'cold-start');
+      // First link tagged the initial finalized span. A second link arriving
+      // immediately after must NOT be lost — the listener should report
+      // "not consumed" so the value is stored.
+      setPendingDeepLink('myapp://second', 'cold-start');
+
+      // Synchronously dispatch the next navigation so the pending value is
+      // consumed before the staleness-window timer advances fake time.
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const spanBEvent = client.eventQueue.find(e => e.transaction === 'New Screen');
+      expect(spanBEvent?.contexts?.trace?.data?.['deeplink.url']).toBe('myapp://second');
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | discarded dispatch does not consume the pending link', async () => {
+      // Reproduces Cursor bugbot's "early consume loses pending link" finding.
+      // A dispatch may turn out to be a noop (no state change → timeout →
+      // discard). The pending link must survive that discard so the *next*
+      // real navigation — the one actually caused by the link — still gets
+      // attributed.
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      setPendingDeepLink('myapp://profile/123', 'warm-open');
+
+      // First dispatch never produces a state change. The next dispatch will
+      // discard it synchronously (the "a transaction was detected that turned
+      // out to be a noop" branch), exercising the discard path *without*
+      // advancing fake time past the staleness window.
+      mockNavigation.emitCancelledNavigation();
+
+      // Second dispatch is the real navigation. It must still pick up the link.
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const data = client.event?.contexts?.trace?.data ?? {};
+      expect(data['navigation.trigger']).toBe('deeplink');
+      expect(data['deeplink.url']).toBe('myapp://profile/<id>');
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | same-route state change still attributes the link', async () => {
+      // Reproduces Cursor bugbot's "same-route path skips deeplink retry"
+      // finding. Deep-linking to the screen you're already on is a legitimate
+      // case — the dispatch still happens and an idle span still starts, so
+      // the link must be attached even when the resulting route key matches
+      // the previous one.
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      setPendingDeepLink('myapp://initial', 'warm-open');
+      mockNavigation.navigateToInitialScreen(); // same key as the just-flushed init
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const data = client.event?.contexts?.trace?.data ?? {};
+      // We don't care which event captures it (the same-route branch ends the
+      // span via the idle path), but the attribute MUST be present.
+      expect(data['navigation.trigger']).toBe('deeplink');
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | cold start: link arriving after span starts but before state change still attaches', async () => {
+      // Simulates cold start: the React Navigation idle span is started in
+      // `afterAllSetup`, then `Linking.getInitialURL()` resolves a microtask
+      // later, then the route state finally changes. We model this by
+      // emitting the dispatch (which creates the span), THEN setting the
+      // pending deep link, THEN letting the state change fire.
+      setupTestClient();
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      mockNavigation.emitNavigationWithoutStateChange();
+      setPendingDeepLink('myapp://profile/123', 'cold-start');
+      mockNavigation.completeStateChangeToNewScreen();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const data = client.event?.contexts?.trace?.data ?? {};
+      expect(data['navigation.trigger']).toBe('deeplink');
+      expect(data['deeplink.url']).toBe('myapp://profile/<id>');
+
+      clearPendingDeepLink();
+    });
+
+    test('deep-link hand-off | consumes the pending value exactly once', async () => {
+      setupTestClient();
+      jest.runOnlyPendingTimers();
+
+      setPendingDeepLink('myapp://profile/123', 'warm-open');
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+      expect(client.event?.contexts?.trace?.data?.['navigation.trigger']).toBe('deeplink');
+
+      // The next navigation must not inherit the deep-link attribution.
+      mockNavigation.navigateToSecondScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+      expect(client.event?.contexts?.trace?.data?.['navigation.trigger']).toBeUndefined();
+      expect(client.event?.contexts?.trace?.data?.['deeplink.url']).toBeUndefined();
+    });
+
+    test('drains the pending value even when the listener short-circuits (no leak onto the next nav)', async () => {
+      // Reproduces the bug flagged by sentry-bot/cursor-bot: with
+      // `useDispatchedActionData: true`, a dispatched action without a route
+      // name in its payload makes `startIdleNavigationSpan` early-return before
+      // creating a span. The pending Expo Router value must still be drained,
+      // otherwise the *next* unrelated navigation inherits the wrong
+      // `navigation.method`.
+      setupTestClient({ useDispatchedActionData: true });
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      // Simulate `router.back()` (or any wrapped method) whose underlying
+      // dispatch carries no route name in payload — the listener short-circuits.
+      setPendingExpoRouterNavigation({ method: 'back' });
+      mockNavigation.emitCancelledNavigation();
+      jest.runOnlyPendingTimers();
+
+      // Next, unrelated navigation — must NOT inherit `navigation.method: 'back'`.
+      mockNavigation.navigateToNewScreenWithPayload();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      expect(client.event?.contexts?.trace?.data?.['navigation.method']).toBeUndefined();
+    });
+  });
+
+  test('transaction has correct metadata after multiple navigations', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.navigateToNewScreen();
+    jest.runOnlyPendingTimers(); // Flush the navigation transaction
+
+    mockNavigation.navigateToSecondScreen();
+    jest.runOnlyPendingTimers(); // Flush the navigation transaction
+
+    await client.flush();
+
+    const actualEvent = client.event;
+    expect(actualEvent).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'Second Screen',
+        contexts: expect.objectContaining({
+          trace: expect.objectContaining({
+            data: {
+              [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'Second Screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_KEY]: 'second_screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_HAS_BEEN_SEEN]: false,
+              [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]: 'New Screen',
+              [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_KEY]: 'new_screen',
+              [SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN]: SPAN_ORIGIN_AUTO_NAVIGATION_REACT_NAVIGATION,
+              [SEMANTIC_ATTRIBUTE_SENTRY_SOURCE]: 'component',
+              [SEMANTIC_ATTRIBUTE_SENTRY_OP]: 'navigation',
+              [SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE]: 1,
+              [SEMANTIC_ATTRIBUTE_SENTRY_IDLE_SPAN_FINISH_REASON]: 'idleTimeout',
+              [SPAN_THREAD_NAME]: SPAN_THREAD_NAME_JAVASCRIPT,
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  test('start span option changed in before start span callback', async () => {
+    setupTestClient({
+      beforeSpanStart: startSpanOption => {
+        startSpanOption.name = 'New Span Name';
+        return startSpanOption;
+      },
+    });
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.navigateToNewScreen();
+    jest.runOnlyPendingTimers(); // Flush the navigation transaction
+
+    await client.flush();
+
+    const actualEvent = client.event;
+    expect(actualEvent).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'New Span Name',
+        contexts: expect.objectContaining({
+          trace: expect.objectContaining({
+            data: {
+              [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'New Screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_KEY]: 'new_screen',
+              [SEMANTIC_ATTRIBUTE_ROUTE_HAS_BEEN_SEEN]: false,
+              [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]: 'Initial Screen',
+              [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_KEY]: 'initial_screen',
+              [SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN]: SPAN_ORIGIN_AUTO_NAVIGATION_REACT_NAVIGATION,
+              [SEMANTIC_ATTRIBUTE_SENTRY_SOURCE]: 'component',
+              [SEMANTIC_ATTRIBUTE_SENTRY_OP]: 'navigation',
+              [SEMANTIC_ATTRIBUTE_SENTRY_SAMPLE_RATE]: 1,
+              [SEMANTIC_ATTRIBUTE_SENTRY_IDLE_SPAN_FINISH_REASON]: 'idleTimeout',
+              [SPAN_THREAD_NAME]: SPAN_THREAD_NAME_JAVASCRIPT,
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  test('transaction not sent on a cancelled navigation', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.emitCancelledNavigation();
+    jest.runOnlyPendingTimers(); // Flush the cancelled navigation
+
+    await client.flush();
+
+    expect(client.eventQueue.length).toBe(1);
+    expect(client.event).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'Initial Screen',
+      }),
+    );
+  });
+
+  test('transaction not sent on multiple cancelled navigations', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.emitCancelledNavigation();
+    jest.runOnlyPendingTimers(); // Flush the cancelled navigation
+
+    mockNavigation.emitCancelledNavigation();
+    jest.runOnlyPendingTimers(); // Flush the cancelled navigation
+
+    await client.flush();
+
+    expect(client.eventQueue.length).toBe(1);
+    expect(client.event).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'Initial Screen',
+      }),
+    );
+  });
+
+  test('empty Route Change transaction is not sent when route is undefined', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.emitNavigationWithUndefinedRoute();
+    jest.runOnlyPendingTimers(); // Flush the empty route change transaction
+
+    await client.flush();
+
+    // Only the initial transaction should be sent
+    expect(client.eventQueue.length).toBe(1);
+    expect(client.event).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'Initial Screen',
+      }),
+    );
+  });
+
+  test('empty Route Change transaction is recorded as dropped', async () => {
+    const mockRecordDroppedEvent = jest.fn();
+    setupTestClient();
+    client.recordDroppedEvent = mockRecordDroppedEvent;
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.emitNavigationWithUndefinedRoute();
+    jest.runOnlyPendingTimers(); // Flush the empty route change transaction
+
+    await client.flush();
+
+    // Should have recorded a dropped transaction via the tracing integration's
+    // event processor (no longer reported as a sampling drop).
+    expect(mockRecordDroppedEvent).toHaveBeenCalledWith('event_processor', 'transaction');
+  });
+
+  test('empty Route Change transaction is not sent after multiple undefined routes', async () => {
+    setupTestClient();
+    jest.runOnlyPendingTimers(); // Flush the init transaction
+
+    mockNavigation.emitNavigationWithUndefinedRoute();
+    jest.runOnlyPendingTimers(); // Flush the first empty route change transaction
+
+    mockNavigation.emitNavigationWithUndefinedRoute();
+    jest.runOnlyPendingTimers(); // Flush the second empty route change transaction
+
+    await client.flush();
+
+    // Only the initial transaction should be sent
+    expect(client.eventQueue.length).toBe(1);
+    expect(client.event).toEqual(
+      expect.objectContaining({
+        type: 'transaction',
+        transaction: 'Initial Screen',
+      }),
+    );
+  });
+
+  describe('navigation container registration', () => {
+    test('registers navigation container object ref', () => {
+      const instrumentation = reactNavigationIntegration();
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer({
+        current: mockNavigationContainer,
+      });
+
+      expect(RN_GLOBAL_OBJ.__sentry_rn_v5_registered).toBe(true);
+
+      expect(mockNavigationContainer.addListener).toHaveBeenCalledTimes(2);
+      expect(mockNavigationContainer.addListener).toHaveBeenNthCalledWith(1, '__unsafe_action__', expect.any(Function));
+      expect(mockNavigationContainer.addListener).toHaveBeenNthCalledWith(2, 'state', expect.any(Function));
+    });
+
+    test('registers navigation container direct ref', () => {
+      const instrumentation = reactNavigationIntegration();
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer(mockNavigationContainer);
+
+      expect(RN_GLOBAL_OBJ.__sentry_rn_v5_registered).toBe(true);
+
+      expect(mockNavigationContainer.addListener).toHaveBeenCalledTimes(2);
+      expect(mockNavigationContainer.addListener).toHaveBeenNthCalledWith(1, '__unsafe_action__', expect.any(Function));
+      expect(mockNavigationContainer.addListener).toHaveBeenNthCalledWith(2, 'state', expect.any(Function));
+    });
+
+    test('does not register navigation container if the existing one is already registered', () => {
+      const instrumentation = reactNavigationIntegration();
+
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer({
+        current: mockNavigationContainer,
+      });
+
+      // Clear mocks after the first registration
+      jest.clearAllMocks();
+
+      instrumentation.registerNavigationContainer({
+        current: mockNavigationContainer,
+      });
+
+      expect(RN_GLOBAL_OBJ.__sentry_rn_v5_registered).toBe(true);
+
+      expect(mockNavigationContainer.addListener).not.toHaveBeenCalled();
+    });
+
+    test('does register navigation container if received a new reference', () => {
+      const instrumentation = reactNavigationIntegration();
+      const refHolder: { current: MockNavigationContainer | undefined } = { current: undefined };
+      const firstContainer = new MockNavigationContainer();
+      const secondContainer = new MockNavigationContainer();
+
+      refHolder.current = firstContainer;
+      instrumentation.registerNavigationContainer(refHolder);
+
+      refHolder.current = secondContainer;
+      instrumentation.registerNavigationContainer(refHolder);
+
+      expect(RN_GLOBAL_OBJ.__sentry_rn_v5_registered).toBe(true);
+
+      expect(firstContainer.addListener).toHaveBeenCalledTimes(2);
+      expect(firstContainer.addListener).toHaveBeenNthCalledWith(1, '__unsafe_action__', expect.any(Function));
+      expect(firstContainer.addListener).toHaveBeenNthCalledWith(2, 'state', expect.any(Function));
+
+      expect(secondContainer.addListener).toHaveBeenCalledTimes(2);
+      expect(secondContainer.addListener).toHaveBeenNthCalledWith(1, '__unsafe_action__', expect.any(Function));
+      expect(secondContainer.addListener).toHaveBeenNthCalledWith(2, 'state', expect.any(Function));
+    });
+
+    test('does not register navigation container if received a new holder with the same reference', () => {
+      const instrumentation = reactNavigationIntegration();
+      const container = new MockNavigationContainer();
+
+      instrumentation.registerNavigationContainer({
+        current: container,
+      });
+
+      instrumentation.registerNavigationContainer({
+        current: container,
+      });
+
+      expect(RN_GLOBAL_OBJ.__sentry_rn_v5_registered).toBe(true);
+
+      expect(container.addListener).toHaveBeenCalledTimes(2);
+      expect(container.addListener).toHaveBeenNthCalledWith(1, '__unsafe_action__', expect.any(Function));
+      expect(container.addListener).toHaveBeenNthCalledWith(2, 'state', expect.any(Function));
+    });
+
+    test('works if routing instrumentation setup is after navigation registration', async () => {
+      const instrumentation = reactNavigationIntegration();
+
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer(mockNavigationContainer);
+
+      instrumentation.afterAllSetup(client);
+      const mockTransaction = getActiveSpan() as SentrySpan;
+
+      await jest.runOnlyPendingTimersAsync();
+
+      expect(spanToJSON(mockTransaction).data?.['sentry.rn.discard_reason']).toBeUndefined();
+      expect(mockTransaction['_sampled']).not.toBe(false);
+    });
+
+    test('after all setup registers for runApplication calls', async () => {
+      const { mockedGetAppRegistryIntegration, mockedOnRunApplication } = mockAppRegistryIntegration();
+
+      const instrumentation = reactNavigationIntegration();
+
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer(mockNavigationContainer);
+
+      instrumentation.afterAllSetup(client);
+      await jest.runOnlyPendingTimersAsync();
+
+      expect(getActiveSpan()).toBeUndefined();
+      expect(mockedGetAppRegistryIntegration).toHaveBeenCalledOnce();
+      expect(mockedOnRunApplication).toHaveBeenCalledOnce();
+
+      const runApplicationCallback = mockedOnRunApplication.mock.calls[0][0];
+      runApplicationCallback();
+
+      const span = getActiveSpan();
+      expect(span).toBeDefined();
+      expect(spanToJSON(span)).toEqual(
+        expect.objectContaining({
+          description: DEFAULT_NAVIGATION_SPAN_NAME,
+          op: 'navigation',
+        }),
+      );
+    });
+
+    test('runApplication calls are ignored when the initial state is not handled', async () => {
+      // This avoid starting a new navigation span when the application run was called before
+      // before the first navigation container is registered.
+
+      const { mockedGetAppRegistryIntegration, mockedOnRunApplication } = mockAppRegistryIntegration();
+
+      reactNavigationIntegration().afterAllSetup(client);
+      await jest.runOnlyPendingTimersAsync(); // Flushes the initial navigation span
+
+      expect(getActiveSpan()).toBeUndefined();
+      expect(mockedGetAppRegistryIntegration).toHaveBeenCalledOnce();
+      expect(mockedOnRunApplication).toHaveBeenCalledOnce();
+
+      const runApplicationCallback = mockedOnRunApplication.mock.calls[0][0];
+      runApplicationCallback();
+
+      const span = getActiveSpan();
+      expect(span).toBeUndefined();
+    });
+
+    test('handles graceful missing app registry integration', async () => {
+      // This avoid starting a new navigation span when the application run was called before
+      // before the first navigation container is registered.
+
+      const { mockedGetAppRegistryIntegration, mockedOnRunApplication } = mockAppRegistryIntegration();
+      mockedOnRunApplication.mockReturnValue(undefined);
+
+      reactNavigationIntegration().afterAllSetup(client);
+
+      expect(mockedGetAppRegistryIntegration).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe('deferred initial span creation', () => {
+    test('initial span is created in registerNavigationContainer when called after afterAllSetup', async () => {
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+      });
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      // No span created yet — no navigation container registered
+      expect(getActiveSpan()).toBeUndefined();
+
+      // Register navigation container after init (production flow)
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer({ current: mockNavigationContainer });
+
+      const span = getActiveSpan();
+      expect(span).toBeDefined();
+      expect(spanToJSON(span!).description).toBe('Route');
+
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(client.event).toEqual(
+        expect.objectContaining({
+          type: 'transaction',
+          transaction: 'Route',
+        }),
+      );
+    });
+
+    test('initial span is not discarded by idle timeout when container registers after init', async () => {
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+      });
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      // Simulate a delay before container registration (e.g. auth gate, slow render)
+      jest.advanceTimersByTime(500);
+      expect(getActiveSpan()).toBeUndefined();
+
+      // Register after 500ms — should still create the span successfully
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer({ current: mockNavigationContainer });
+
+      const span = getActiveSpan();
+      expect(span).toBeDefined();
+
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(client.event).toEqual(
+        expect.objectContaining({
+          type: 'transaction',
+          transaction: 'Route',
+        }),
+      );
+    });
+
+    test('afterAllSetup does not create span when navigation container is not registered', () => {
+      const instrumentation = reactNavigationIntegration();
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      // No navigation container registered — no span should be created
+      expect(getActiveSpan()).toBeUndefined();
+    });
+
+    test('subsequent navigations work after deferred initial span', async () => {
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+      });
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      mockNavigation = createMockNavigationAndAttachTo(instrumentation);
+
+      // Flush the initial span
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      expect(client.event).toEqual(
+        expect.objectContaining({
+          type: 'transaction',
+          transaction: 'Initial Screen',
+        }),
+      );
+
+      // Navigate to a new screen
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      expect(client.event).toEqual(
+        expect.objectContaining({
+          type: 'transaction',
+          transaction: 'New Screen',
+        }),
+      );
+    });
+
+    test('runApplication creates span after deferred initial state is handled', async () => {
+      const { mockedOnRunApplication } = mockAppRegistryIntegration();
+
+      const instrumentation = reactNavigationIntegration();
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      // Register container after init
+      const mockNavigationContainer = new MockNavigationContainer();
+      instrumentation.registerNavigationContainer({ current: mockNavigationContainer });
+
+      // Flush initial span
+      await jest.runOnlyPendingTimersAsync();
+
+      // Simulate app restart via runApplication
+      const runApplicationCallback = mockedOnRunApplication.mock.calls[0][0];
+      runApplicationCallback();
+
+      const span = getActiveSpan();
+      expect(span).toBeDefined();
+      expect(spanToJSON(span!).op).toBe('navigation');
+    });
+  });
+
+  describe('options', () => {
+    test('waits until routeChangeTimeoutMs', () => {
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+      });
+
+      instrumentation.afterAllSetup(client);
+
+      const mockNavigationContainerRef = {
+        current: new MockNavigationContainer(),
+      };
+
+      instrumentation.registerNavigationContainer(mockNavigationContainerRef as any);
+      mockNavigationContainerRef.current.listeners['__unsafe_action__']({});
+      const mockTransaction = getActiveSpan() as SentrySpan;
+
+      jest.advanceTimersByTime(190);
+
+      expect(mockTransaction['_sampled']).toBe(true);
+      expect(mockTransaction['_name']).toBe(DEFAULT_NAVIGATION_SPAN_NAME);
+      expect(spanToJSON(mockTransaction).data?.['sentry.rn.discard_reason']).toBeUndefined();
+
+      jest.advanceTimersByTime(20);
+
+      // After the routeChangeTimeout, the SDK marks the span for discard via a
+      // dedicated attribute (instead of mutating the private `_sampled` flag)
+      // so the tracing integration's event processor drops it.
+      // `ignoreEmptyRouteChangeTransactions` runs after `_discardLatestTransaction`
+      // and overwrites the reason with the more specific `no_route_info`.
+      expect(mockTransaction['_sampled']).toBe(true);
+      expect(spanToJSON(mockTransaction).data?.['sentry.rn.discard_reason']).toBe('no_route_info');
+    });
+  });
+
+  describe('shouldCreateSpanForRequest', () => {
+    it('should return false for Dev Server URLs', () => {
+      const devServerUrl = 'http://localhost:8081';
+      (getDevServer as jest.Mock).mockReturnValue({ url: devServerUrl });
+
+      const rnTracing = reactNativeTracingIntegration();
+
+      const result = rnTracing.options.shouldCreateSpanForRequest(devServerUrl);
+
+      expect(result).toBe(false);
+    });
+
+    it('should return true for non Dev Server URLs', () => {
+      const devServerUrl = 'http://localhost:8081';
+      (getDevServer as jest.Mock).mockReturnValue({ url: devServerUrl });
+
+      const rnTracing = reactNativeTracingIntegration();
+
+      const result = rnTracing.options.shouldCreateSpanForRequest('http://some-other-url.com');
+
+      expect(result).toBe(true);
+    });
+
+    it('should chain the user defined shouldCreateSpanForRequest if defined', () => {
+      const devServerUrl = 'http://localhost:8081';
+      (getDevServer as jest.Mock).mockReturnValue({ url: devServerUrl });
+
+      const userShouldCreateSpanForRequest = (_url: string): boolean => {
+        return false;
+      };
+
+      const rnTracing = reactNativeTracingIntegration({ shouldCreateSpanForRequest: userShouldCreateSpanForRequest });
+
+      const result = rnTracing.options.shouldCreateSpanForRequest('http://some-other-url.com');
+
+      expect(result).toBe(false);
+    });
+
+    it('should handle undefined devServerUrls by using only the user defined shouldCreateSpanForRequest', () => {
+      (getDevServer as jest.Mock).mockReturnValue({ url: undefined });
+
+      const userShouldCreateSpanForRequest = (_url: string): boolean => {
+        return true;
+      };
+
+      const rnTracing = reactNativeTracingIntegration({ shouldCreateSpanForRequest: userShouldCreateSpanForRequest });
+
+      const result = rnTracing.options.shouldCreateSpanForRequest('http://any-url.com');
+
+      expect(result).toBe(true);
+    });
+
+    it('should not set the shouldCreateSpanForRequest if not user provided and the devServerUrl is undefined', () => {
+      (getDevServer as jest.Mock).mockReturnValue({ url: undefined });
+
+      const rnTracing = reactNativeTracingIntegration();
+
+      expect(rnTracing.options.shouldCreateSpanForRequest).toBe(undefined);
+    });
+  });
+
+  [true, false].forEach(useDispatchedActionData => {
+    describe(`test actions which should not create a navigation span when useDispatchedActionData is ${useDispatchedActionData}`, () => {
+      beforeEach(async () => {
+        setupTestClient({ useDispatchedActionData });
+        await jest.runOnlyPendingTimers(); // Flushes the initial navigation span
+        client.event = undefined;
+      });
+
+      test(`noop does ${useDispatchedActionData ? 'not' : ''}create a navigation span`, async () => {
+        mockNavigation.emitWithStateChange({
+          data: {
+            action: {
+              type: 'UNKNOWN',
+            },
+            noop: true,
+            stack: undefined,
+          },
+        });
+        await jest.runOnlyPendingTimersAsync();
+        await client.flush();
+
+        expect(client.event === undefined).toBe(useDispatchedActionData);
+      });
+
+      test.each(['PRELOAD', 'SET_PARAMS', 'OPEN_DRAWER', 'CLOSE_DRAWER', 'TOGGLE_DRAWER'])(
+        `%s does ${useDispatchedActionData ? 'not' : ''}create a navigation span`,
+        async actionType => {
+          mockNavigation.emitWithStateChange({
+            data: {
+              action: {
+                type: actionType,
+              },
+              noop: false,
+              stack: undefined,
+            },
+          });
+          await jest.runOnlyPendingTimersAsync();
+          await client.flush();
+
+          expect(client.event === undefined).toBe(useDispatchedActionData);
+        },
+      );
+    });
+  });
+
+  describe('withAnchor POP_TO bookkeeping dispatch (#6434)', () => {
+    // `router.dismissTo('/ScreenB', { withAnchor: true })` navigates to ScreenB
+    // (a real POP_TO) and, on some expo-router versions, immediately issues a
+    // second POP_TO to the same route purely to stamp `initial: false`. That
+    // bookkeeping dispatch carries no state change of its own and must not
+    // produce a second, spurious navigation transaction.
+    const realPopTo: UnsafeAction = {
+      data: {
+        action: { type: 'POP_TO', payload: { name: 'ScreenB', params: {} } },
+        noop: false,
+        stack: undefined,
+      },
+    };
+    const bookkeepingPopTo: UnsafeAction = {
+      data: {
+        action: { type: 'POP_TO', payload: { name: 'ScreenB', params: { initial: false } } },
+        noop: false,
+        stack: undefined,
+      },
+    };
+
+    function countTransactionsNamed(name: string): number {
+      return client.eventQueue.filter(e => e.type === 'transaction' && e.transaction === name).length;
+    }
+
+    test('does not create a second transaction for the bookkeeping dispatch', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers(); // Flush the initial navigation span
+      client.eventQueue = [];
+
+      // Real navigation to ScreenB — resolves via a state change.
+      mockNavigation.emitWithStateChange(realPopTo, { key: 'screen_b', name: 'ScreenB' });
+      await jest.runOnlyPendingTimersAsync();
+
+      // withAnchor bookkeeping POP_TO to the same route. It only flips
+      // `params.initial`, which React Navigation reports as a state change to
+      // the same route key.
+      mockNavigation.emitWithStateChange(bookkeepingPopTo, { key: 'screen_b', name: 'ScreenB' });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(countTransactionsNamed('ScreenB')).toBe(1);
+    });
+
+    test('does not create a second transaction with useDispatchedActionData disabled (default Expo setup)', async () => {
+      // The guards are driven off `actionType`, not the opt-in flag, so the
+      // default `expoRouterIntegration` setup (flag off) is fixed too.
+      setupTestClient({ useDispatchedActionData: false });
+      await jest.runOnlyPendingTimers();
+      client.eventQueue = [];
+
+      mockNavigation.emitWithStateChange(realPopTo, { key: 'screen_b', name: 'ScreenB' });
+      await jest.runOnlyPendingTimersAsync();
+
+      mockNavigation.emitWithStateChange(bookkeepingPopTo, { key: 'screen_b', name: 'ScreenB' });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(client.eventQueue.filter(e => e.type === 'transaction').length).toBe(1);
+    });
+
+    test('still creates a transaction for a genuine popTo navigation', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers(); // Flush the initial navigation span
+      client.eventQueue = [];
+
+      // A real dismissTo/popTo to a different route must still be traced.
+      mockNavigation.emitWithStateChange(realPopTo, { key: 'screen_b', name: 'ScreenB' });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(countTransactionsNamed('ScreenB')).toBe(1);
+    });
+
+    test('still creates a span for a popTo to an earlier same-named route in the stack', async () => {
+      // Stack with a repeated route name (e.g. Expo Router `[id]`): on Detail(#2),
+      // popTo the earlier Detail(#1). The target name matches the focused leaf
+      // name, but the bookkeeping marker (`initial: false`) is absent, so this
+      // real, key-changing navigation must NOT be filtered.
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers();
+      client.eventQueue = [];
+
+      mockNavigation.emitWithStateChange(
+        { data: { action: { type: 'PUSH', payload: { name: 'Detail' } }, noop: false, stack: undefined } },
+        { key: 'detail_2', name: 'Detail' },
+      );
+      await jest.runOnlyPendingTimersAsync();
+      client.eventQueue = [];
+
+      mockNavigation.emitWithStateChange(
+        { data: { action: { type: 'POP_TO', payload: { name: 'Detail' } }, noop: false, stack: undefined } },
+        { key: 'detail_1', name: 'Detail' },
+      );
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(countTransactionsNamed('Detail')).toBe(1);
+    });
+
+    test('discards a bookkeeping POP_TO that slips past the dispatch-time filter (same route key)', async () => {
+      // Payload name matches no focused route (e.g. a parent navigator name),
+      // so the dispatch-time filter misses, but the state change lands on the
+      // same route key — the state-change guard must discard the span.
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers();
+      client.eventQueue = [];
+
+      mockNavigation.emitWithStateChange({
+        data: {
+          action: { type: 'POP_TO', payload: { name: '(app)', params: { initial: false } } },
+          noop: false,
+          stack: undefined,
+        },
+      });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(client.eventQueue.filter(e => e.type === 'transaction').length).toBe(0);
+    });
+
+    test('keeps a same-route POP_TO span that carries a deep link', async () => {
+      // A same-route POP_TO that is actually a deep link to the screen you are
+      // already on must NOT be discarded by the bookkeeping guard.
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers();
+      client.eventQueue = [];
+
+      setPendingDeepLink('myapp://initial-screen', 'warm-open');
+      mockNavigation.emitWithStateChange({
+        data: {
+          action: { type: 'POP_TO', payload: { name: '(app)', params: { initial: false } } },
+          noop: false,
+          stack: undefined,
+        },
+      });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(client.event?.contexts?.trace?.data?.['navigation.trigger']).toBe('deeplink');
+      clearPendingDeepLink();
+    });
+
+    test('a focused-route bookkeeping POP_TO does not tear down an in-flight navigation span', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers();
+
+      // Start a real, still-in-flight navigation (dispatch with a route name in
+      // the payload, but no state change yet).
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: { type: 'NAVIGATE', payload: { name: 'New Screen' } },
+          noop: false,
+          stack: undefined,
+        },
+      });
+      const activeSpan = getActiveSpan();
+      expect(activeSpan).toBeDefined();
+
+      // The withAnchor bookkeeping POP_TO to the already-focused route must not
+      // discard that in-flight span via the "noop transaction" branch.
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: { type: 'POP_TO', payload: { name: 'Initial Screen', params: { initial: false } } },
+          noop: false,
+          stack: undefined,
+        },
+      });
+
+      expect(getActiveSpan()).toBe(activeSpan);
+    });
+  });
+
+  describe('NAVIGATE onto the already-focused route with new params (#6593)', () => {
+    // navigate('Chat', { id: 2 }) while Chat/id:1 is focused keeps the same
+    // route.key (only params change), but is a genuine screen entry and must
+    // ship a named transaction, not an unnamed "Route Change".
+    const navigateToChat: UnsafeAction = {
+      data: {
+        action: { type: 'NAVIGATE', payload: { name: 'Chat' } },
+        noop: false,
+        stack: undefined,
+      },
+    };
+
+    function countTransactionsNamed(name: string): number {
+      return client.eventQueue.filter(e => e.type === 'transaction' && e.transaction === name).length;
+    }
+
+    test('ships a named transaction instead of an unnamed "Route Change"', async () => {
+      // ignoreEmptyBackNavigationTransactions: false isolates the naming
+      // behaviour from the empty-back-navigation discard.
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        ignoreEmptyBackNavigationTransactions: false,
+        useDispatchedActionData: true,
+      });
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      mockNavigation = createMockNavigationAndAttachTo(instrumentation);
+      await jest.runOnlyPendingTimersAsync(); // Flush the initial span
+
+      // Enter Chat for conversation 1.
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 1 } });
+      await jest.runOnlyPendingTimersAsync();
+      client.eventQueue = [];
+
+      // Tap a notification for conversation 2 — same route key, new params.
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 2 } });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(countTransactionsNamed('Chat')).toBe(1);
+      expect(countTransactionsNamed(DEFAULT_NAVIGATION_SPAN_NAME)).toBe(0);
+      const chat = client.eventQueue.find(e => e.type === 'transaction' && e.transaction === 'Chat');
+      expect(chat?.contexts?.trace?.op).toBe('navigation');
+      expect(chat?.contexts?.trace?.data?.[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('Chat');
+      expect(chat?.contexts?.trace?.data?.[SEMANTIC_ATTRIBUTE_ROUTE_KEY]).toBe('chat');
+    });
+
+    test('detects a param change when only disjoint undefined-valued keys differ', async () => {
+      // { a: undefined } -> { b: undefined }: same key count, disjoint keys.
+      // haveRouteParamsChanged must still report a change, so the span goes
+      // through the naming path (which sets route.key/route.name) rather than
+      // the no-op idle path (which does not).
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        ignoreEmptyBackNavigationTransactions: false,
+        useDispatchedActionData: true,
+      });
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      mockNavigation = createMockNavigationAndAttachTo(instrumentation);
+      await jest.runOnlyPendingTimersAsync(); // Flush the initial span
+
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { a: undefined } });
+      await jest.runOnlyPendingTimersAsync();
+      client.eventQueue = [];
+
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { b: undefined } });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      const chat = client.eventQueue.find(e => e.type === 'transaction' && e.transaction === 'Chat');
+      expect(chat?.contexts?.trace?.data?.[SEMANTIC_ATTRIBUTE_ROUTE_KEY]).toBe('chat');
+      expect(chat?.contexts?.trace?.data?.[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('Chat');
+    });
+
+    test('does not leak an unnamed transaction when the re-navigation is empty (default config)', async () => {
+      // Under the default config an empty same-key re-nav is discarded as an
+      // empty back navigation, not leaked as an unnamed "Route Change".
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimersAsync(); // Flush the initial span
+
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 1 } });
+      await jest.runOnlyPendingTimersAsync();
+      client.eventQueue = [];
+
+      // Re-navigate onto the already-focused "Chat" with new params (same key).
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 2 } });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      // Under the default config the re-nav is intentionally discarded as an
+      // empty back navigation, so neither an unnamed nor a named "Chat"
+      // transaction ships.
+      expect(countTransactionsNamed(DEFAULT_NAVIGATION_SPAN_NAME)).toBe(0);
+      expect(countTransactionsNamed('Chat')).toBe(0);
+    });
+
+    test('names the transaction with useDispatchedActionData off (true #6593 repro)', async () => {
+      // With useDispatchedActionData off the idle span starts unnamed
+      // (DEFAULT_NAVIGATION_SPAN_NAME). Before the fix, the same-key/changed-
+      // params branch dropped the span reference without naming it, so it
+      // self-finalized as an unnamed "Route Change". This is the actual bug
+      // mode; the fix must derive the name from the mounted route instead.
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        ignoreEmptyBackNavigationTransactions: false,
+        useDispatchedActionData: false,
+      });
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      mockNavigation = createMockNavigationAndAttachTo(instrumentation);
+      await jest.runOnlyPendingTimersAsync(); // Flush the initial span
+
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 1 } });
+      await jest.runOnlyPendingTimersAsync();
+      client.eventQueue = [];
+
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 2 } });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      expect(countTransactionsNamed('Chat')).toBe(1);
+      expect(countTransactionsNamed(DEFAULT_NAVIGATION_SPAN_NAME)).toBe(0);
+    });
+
+    test('takes the no-op idle path when the same-key re-nav does not change params', async () => {
+      // Same key and unchanged params ({ id: 1 } -> { id: 1 }) is a no-op: the
+      // span must end via the idle timeout without going through the naming
+      // path. useDispatchedActionData keeps it named "Chat" (from dispatch), so
+      // the discriminator is the absence of the route.key/route.name attributes
+      // that only the naming path sets.
+      const instrumentation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        ignoreEmptyBackNavigationTransactions: false,
+        useDispatchedActionData: true,
+      });
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [instrumentation],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      mockNavigation = createMockNavigationAndAttachTo(instrumentation);
+      await jest.runOnlyPendingTimersAsync(); // Flush the initial span
+
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 1 } });
+      await jest.runOnlyPendingTimersAsync();
+      client.eventQueue = [];
+
+      // Re-dispatch onto the focused route with identical params.
+      mockNavigation.emitWithStateChange(navigateToChat, { key: 'chat', name: 'Chat', params: { id: 1 } });
+      await jest.runOnlyPendingTimersAsync();
+      await client.flush();
+
+      const chat = client.eventQueue.find(e => e.type === 'transaction' && e.transaction === 'Chat');
+      expect(chat).toBeDefined();
+      expect(chat?.contexts?.trace?.data?.[SEMANTIC_ATTRIBUTE_ROUTE_KEY]).toBeUndefined();
+      expect(chat?.contexts?.trace?.data?.[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBeUndefined();
+    });
+  });
+
+  test('noop does not remove the previous navigation span from scope', async () => {
+    setupTestClient({ useDispatchedActionData: true });
+    await jest.runOnlyPendingTimers(); // Flushes the initial navigation span
+
+    mockNavigation.emitNavigationWithoutStateChange();
+    const activeSpan = getActiveSpan();
+
+    mockNavigation.emitWithoutStateChange({
+      data: {
+        action: {
+          type: 'UNKNOWN',
+        },
+        noop: true,
+        stack: undefined,
+      },
+    });
+
+    expect(getActiveSpan()).toBe(activeSpan);
+  });
+
+  test.each(['PRELOAD', 'SET_PARAMS', 'OPEN_DRAWER', 'CLOSE_DRAWER', 'TOGGLE_DRAWER'])(
+    '%s does not remove the previous navigation span from scope',
+    async actionType => {
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers(); // Flushes the initial navigation span
+
+      mockNavigation.emitNavigationWithoutStateChange();
+      const activeSpan = getActiveSpan();
+
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: {
+            type: actionType,
+          },
+          noop: false,
+          stack: undefined,
+        },
+      });
+
+      expect(getActiveSpan()).toBe(activeSpan);
+    },
+  );
+
+  describe('useDispatchedActionData names spans from action payload', () => {
+    beforeEach(async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      await jest.runOnlyPendingTimers(); // Flush the initial navigation span
+      client.event = undefined;
+    });
+
+    test('NAVIGATE action with payload.name sets the span name', async () => {
+      mockNavigation.navigateToNewScreenWithPayload();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event?.transaction).toBe('New Screen');
+    });
+
+    test('span name is updated with final route from state change when it differs from payload', async () => {
+      mockNavigation.navigateToScreenWithMismatchedPayload();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event?.transaction).toBe('ScreenB');
+    });
+
+    test('GO_BACK action (no payload.name) does not create a navigation span', async () => {
+      mockNavigation.emitGoBackWithStateChange();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event).toBeUndefined();
+    });
+
+    test.each(['GO_BACK', 'POP', 'POP_TO_TOP', 'RESET'])(
+      '%s action does not create a navigation span',
+      async actionType => {
+        mockNavigation.emitWithStateChange({
+          data: {
+            action: {
+              type: actionType,
+            },
+            noop: false,
+            stack: undefined,
+          },
+        });
+        await jest.runOnlyPendingTimersAsync();
+        await client.flush();
+
+        expect(client.event).toBeUndefined();
+      },
+    );
+
+    test('PUSH action with payload.name creates a named span', async () => {
+      mockNavigation.emitWithStateChange(
+        {
+          data: {
+            action: {
+              type: 'PUSH',
+              payload: { name: 'PushedScreen' },
+            },
+            noop: false,
+            stack: undefined,
+          },
+        },
+        { key: 'pushed_screen', name: 'PushedScreen' },
+      );
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event?.transaction).toBe('PushedScreen');
+    });
+
+    test('REPLACE action with payload.name creates a named span', async () => {
+      mockNavigation.emitWithStateChange(
+        {
+          data: {
+            action: {
+              type: 'REPLACE',
+              payload: { name: 'ReplacedScreen' },
+            },
+            noop: false,
+            stack: undefined,
+          },
+        },
+        { key: 'replaced_screen', name: 'ReplacedScreen' },
+      );
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event?.transaction).toBe('ReplacedScreen');
+    });
+
+    test('JUMP_TO action with payload.name creates a named span', async () => {
+      mockNavigation.emitWithStateChange(
+        {
+          data: {
+            action: {
+              type: 'JUMP_TO',
+              payload: { name: 'TabScreen' },
+            },
+            noop: false,
+            stack: undefined,
+          },
+        },
+        { key: 'tab_screen', name: 'TabScreen' },
+      );
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event?.transaction).toBe('TabScreen');
+    });
+
+    test('cancelled navigation with dispatched route name is discarded', async () => {
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: {
+            type: 'NAVIGATE',
+            payload: { name: 'OrphanedScreen' },
+          },
+          noop: false,
+          stack: undefined,
+        },
+      });
+      jest.runOnlyPendingTimers(); // Trigger the timeout
+
+      await client.flush();
+
+      expect(client.event).toBeUndefined();
+    });
+
+    test('initial navigation span is created during setup', async () => {
+      // Reset and create fresh client to test initial span
+      const rNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        useDispatchedActionData: true,
+      });
+      createMockNavigationAndAttachTo(rNavigation);
+
+      const rnTracing = reactNativeTracingIntegration();
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, rnTracing],
+        enableAppStartTracking: false,
+      });
+      const freshClient = new TestClient(options);
+      setCurrentClient(freshClient);
+      freshClient.init();
+
+      jest.runOnlyPendingTimers(); // Flush the initial navigation span
+
+      await freshClient.flush();
+
+      // Initial span should be created with 'Initial Screen' from the mock container
+      expect(freshClient.event?.transaction).toBe('Initial Screen');
+    });
+  });
+
+  describe('useDispatchedActionData disabled (default) still uses generic span name', () => {
+    beforeEach(async () => {
+      setupTestClient({ useDispatchedActionData: false });
+      await jest.runOnlyPendingTimers(); // Flush the initial navigation span
+      client.event = undefined;
+    });
+
+    test('GO_BACK action still creates a navigation span', async () => {
+      mockNavigation.emitGoBackWithStateChange();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      expect(client.event?.transaction).toBe('Previous Screen');
+    });
+  });
+
+  describe('setCurrentRoute', () => {
+    let mockSetCurrentRoute: jest.Mock;
+
+    beforeEach(() => {
+      mockSetCurrentRoute = jest.fn();
+      const rnTracingIntegration = reactNativeTracingIntegration();
+      rnTracingIntegration.setCurrentRoute = mockSetCurrentRoute;
+
+      const rNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+      });
+      mockNavigation = createMockNavigationAndAttachTo(rNavigation);
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, rnTracingIntegration],
+        enableAppStartTracking: false,
+      });
+
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      jest.runOnlyPendingTimers();
+    });
+
+    test('setCurrentRoute is called with route name after navigation', async () => {
+      expect(mockSetCurrentRoute).toHaveBeenCalledWith('Initial Screen');
+
+      mockSetCurrentRoute.mockClear();
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+
+      expect(mockSetCurrentRoute).toHaveBeenCalledWith('New Screen');
+
+      mockSetCurrentRoute.mockClear();
+      mockNavigation.navigateToSecondScreen();
+      jest.runOnlyPendingTimers();
+
+      expect(mockSetCurrentRoute).toHaveBeenCalledWith('Second Screen');
+
+      mockSetCurrentRoute.mockClear();
+      mockNavigation.navigateToInitialScreen();
+      jest.runOnlyPendingTimers();
+
+      expect(mockSetCurrentRoute).toHaveBeenCalledWith('Initial Screen');
+    });
+
+    test('setCurrentRoute is not called when navigation is cancelled', async () => {
+      mockSetCurrentRoute.mockClear();
+      mockNavigation.emitCancelledNavigation();
+      jest.runOnlyPendingTimers();
+
+      expect(mockSetCurrentRoute).not.toHaveBeenCalled();
+    });
+
+    test('setCurrentRoute is not called when navigation finishes', async () => {
+      mockSetCurrentRoute.mockClear();
+      mockNavigation.finishAppStartNavigation();
+      jest.runOnlyPendingTimers();
+
+      expect(mockSetCurrentRoute).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('useFullPathsForNavigationRoutes option', () => {
+    test('transaction uses full path when useFullPathsForNavigationRoutes is true', async () => {
+      const rNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        useFullPathsForNavigationRoutes: true,
+      });
+
+      const mockNavigationWithNestedState = createMockNavigationWithNestedState(rNavigation);
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, reactNativeTracingIntegration()],
+        enableAppStartTracking: false,
+      });
+
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      // Navigate to a nested screen: Home -> Settings -> Profile
+      mockNavigationWithNestedState.navigateToNestedScreen();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const actualEvent = client.event;
+      expect(actualEvent).toEqual(
+        expect.objectContaining({
+          contexts: expect.objectContaining({
+            trace: expect.objectContaining({
+              data: expect.objectContaining({
+                [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'Home/Settings/Profile',
+                [SEMANTIC_ATTRIBUTE_ROUTE_KEY]: 'profile_screen',
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    test('transaction uses only route name when useFullPathsForNavigationRoutes is false', async () => {
+      const rNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        useFullPathsForNavigationRoutes: false,
+      });
+
+      const mockNavigationWithNestedState = createMockNavigationWithNestedState(rNavigation);
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, reactNativeTracingIntegration()],
+        enableAppStartTracking: false,
+      });
+
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      jest.runOnlyPendingTimers();
+
+      mockNavigationWithNestedState.navigateToNestedScreen();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const actualEvent = client.event;
+      expect(actualEvent).toEqual(
+        expect.objectContaining({
+          contexts: expect.objectContaining({
+            trace: expect.objectContaining({
+              data: expect.objectContaining({
+                [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'Profile',
+                [SEMANTIC_ATTRIBUTE_ROUTE_KEY]: 'profile_screen',
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    test('transaction uses two-level path with nested tab navigator', async () => {
+      const rNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        useFullPathsForNavigationRoutes: true,
+      });
+
+      const mockNavigationWithNestedState = createMockNavigationWithNestedState(rNavigation);
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, reactNativeTracingIntegration()],
+        enableAppStartTracking: false,
+      });
+
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      jest.runOnlyPendingTimers();
+
+      mockNavigationWithNestedState.navigateToTwoLevelNested();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const actualEvent = client.event;
+      expect(actualEvent).toEqual(
+        expect.objectContaining({
+          contexts: expect.objectContaining({
+            trace: expect.objectContaining({
+              data: expect.objectContaining({
+                [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'Tabs/Settings',
+                [SEMANTIC_ATTRIBUTE_ROUTE_KEY]: 'settings_screen',
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    test('setCurrentRoute receives full path when useFullPathsForNavigationRoutes is true', async () => {
+      const mockSetCurrentRoute = jest.fn();
+      const rnTracingIntegration = reactNativeTracingIntegration();
+      rnTracingIntegration.setCurrentRoute = mockSetCurrentRoute;
+
+      const rNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        useFullPathsForNavigationRoutes: true,
+      });
+
+      const mockNavigationWithNestedState = createMockNavigationWithNestedState(rNavigation);
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, rnTracingIntegration],
+        enableAppStartTracking: false,
+      });
+
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      jest.runOnlyPendingTimers();
+
+      mockSetCurrentRoute.mockClear();
+      mockNavigationWithNestedState.navigateToNestedScreen();
+      jest.runOnlyPendingTimers();
+
+      expect(mockSetCurrentRoute).toHaveBeenCalledWith('Home/Settings/Profile');
+    });
+
+    test('previous route uses full path when useFullPathsForNavigationRoutes is true', async () => {
+      const rNavigation = reactNavigationIntegration({
+        routeChangeTimeoutMs: 200,
+        useFullPathsForNavigationRoutes: true,
+      });
+
+      const mockNavigationWithNestedState = createMockNavigationWithNestedState(rNavigation);
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, reactNativeTracingIntegration()],
+        enableAppStartTracking: false,
+      });
+
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      // First navigation
+      mockNavigationWithNestedState.navigateToNestedScreen();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      // Second navigation
+      mockNavigationWithNestedState.navigateToTwoLevelNested();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const actualEvent = client.event;
+      expect(actualEvent).toEqual(
+        expect.objectContaining({
+          contexts: expect.objectContaining({
+            trace: expect.objectContaining({
+              data: expect.objectContaining({
+                [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'Tabs/Settings',
+                [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]: 'Home/Settings/Profile', // Full path in previous route
+                [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_KEY]: 'profile_screen',
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+  });
+
+  describe('dynamic route params', () => {
+    it('includes dynamic route params from [id] route when sendDefaultPii is true', async () => {
+      setupTestClient({ sendDefaultPii: true });
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      // Navigate to a static screen first so previous_route.name is set to a known value
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers(); // Flush the navigation transaction
+
+      mockNavigation.navigateToDynamicRoute();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const actualEvent = client.event;
+      expect(actualEvent).toEqual(
+        expect.objectContaining({
+          type: 'transaction',
+          transaction: 'profile/[id]',
+          contexts: expect.objectContaining({
+            trace: expect.objectContaining({
+              data: expect.objectContaining({
+                [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'profile/[id]',
+                'route.params.id': '123',
+                [SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]: 'New Screen',
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    it('includes dynamic route params from [...slug] catch-all route joined with / when sendDefaultPii is true', async () => {
+      setupTestClient({ sendDefaultPii: true });
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      mockNavigation.navigateToCatchAllRoute();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const actualEvent = client.event;
+      expect(actualEvent).toEqual(
+        expect.objectContaining({
+          type: 'transaction',
+          transaction: 'posts/[...slug]',
+          contexts: expect.objectContaining({
+            trace: expect.objectContaining({
+              data: expect.objectContaining({
+                [SEMANTIC_ATTRIBUTE_ROUTE_NAME]: 'posts/[...slug]',
+                'route.params.slug': 'tech/react-native',
+              }),
+            }),
+          }),
+        }),
+      );
+    });
+
+    it('does not include dynamic route params when sendDefaultPii is false', async () => {
+      setupTestClient({ sendDefaultPii: false });
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      mockNavigation.navigateToDynamicRoute();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('profile/[id]');
+      expect(traceData['route.params.id']).toBeUndefined();
+    });
+
+    it('does not include non-dynamic params from static routes', async () => {
+      setupTestClient({ sendDefaultPii: true });
+      jest.runOnlyPendingTimers(); // Flush the init transaction
+
+      mockNavigation.navigateToStaticRouteWithParams();
+      jest.runOnlyPendingTimers();
+
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('StaticScreen');
+      expect(traceData['route.params.utm_source']).toBeUndefined();
+    });
+  });
+
+  describe('route override provider (Expo Router integration hook)', () => {
+    function setupWithOverride(setupOptions: { sendDefaultPii?: boolean } = {}) {
+      const rNavigation = reactNavigationIntegration({ routeChangeTimeoutMs: 200 });
+      mockNavigation = createMockNavigationAndAttachTo(rNavigation);
+
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, reactNativeTracingIntegration()],
+        enableAppStartTracking: false,
+        sendDefaultPii: setupOptions.sendDefaultPii,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+
+      return rNavigation;
+    }
+
+    it('uses templated path as route.name and sets route.path; omits url and params without PII', async () => {
+      const rNavigation = setupWithOverride({ sendDefaultPii: false });
+      jest.runOnlyPendingTimers();
+
+      rNavigation._setRouteOverrideProvider(() => ({
+        templatedPath: '/profile/[id]',
+        concreteUrl: '/profile/123?utm_source=email',
+        params: { id: '123', utm_source: 'email' },
+      }));
+
+      mockNavigation.navigateToDynamicRoute();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(client.event?.transaction).toBe('/profile/[id]');
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('/profile/[id]');
+      expect(traceData['route.path']).toBe('/profile/[id]');
+      expect(traceData['route.url']).toBeUndefined();
+      expect(traceData['route.params.id']).toBeUndefined();
+      expect(traceData['route.params.utm_source']).toBeUndefined();
+    });
+
+    it('exposes route.url and only path params (not query) under sendDefaultPii', async () => {
+      const rNavigation = setupWithOverride({ sendDefaultPii: true });
+      jest.runOnlyPendingTimers();
+
+      rNavigation._setRouteOverrideProvider(() => ({
+        templatedPath: '/profile/[id]',
+        concreteUrl: '/profile/123?utm_source=email',
+        params: { id: '123', utm_source: 'email' },
+      }));
+
+      mockNavigation.navigateToDynamicRoute();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('/profile/[id]');
+      expect(traceData['route.path']).toBe('/profile/[id]');
+      expect(traceData['route.url']).toBe('/profile/123?utm_source=email');
+      expect(traceData['route.params.id']).toBe('123');
+      expect(traceData['route.params.utm_source']).toBeUndefined();
+    });
+
+    it('extracts catch-all [...slug] params from the templated path', async () => {
+      const rNavigation = setupWithOverride({ sendDefaultPii: true });
+      jest.runOnlyPendingTimers();
+
+      rNavigation._setRouteOverrideProvider(() => ({
+        templatedPath: '/posts/[...slug]',
+        concreteUrl: '/posts/tech/react-native',
+        params: { slug: ['tech', 'react-native'] },
+      }));
+
+      mockNavigation.navigateToCatchAllRoute();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('/posts/[...slug]');
+      expect(traceData['route.path']).toBe('/posts/[...slug]');
+      expect(traceData['route.params.slug']).toBe('tech/react-native');
+    });
+
+    it('falls back to React Navigation route name when provider returns undefined', async () => {
+      const rNavigation = setupWithOverride();
+      jest.runOnlyPendingTimers();
+
+      rNavigation._setRouteOverrideProvider(() => undefined);
+
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('New Screen');
+      expect(traceData['route.path']).toBeUndefined();
+      expect(traceData['route.url']).toBeUndefined();
+    });
+
+    it('does not throw and falls back when provider throws', async () => {
+      const rNavigation = setupWithOverride();
+      jest.runOnlyPendingTimers();
+
+      rNavigation._setRouteOverrideProvider(() => {
+        throw new Error('boom');
+      });
+
+      mockNavigation.navigateToNewScreen();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('New Screen');
+      expect(traceData['route.path']).toBeUndefined();
+    });
+
+    it('uses overridden name for previous_route.name on subsequent navigations', async () => {
+      const rNavigation = setupWithOverride();
+      jest.runOnlyPendingTimers();
+
+      const sequence = [
+        { templatedPath: '/profile/[id]', params: { id: '1' } },
+        { templatedPath: '/posts/[...slug]', params: { slug: ['a', 'b'] } },
+      ];
+      let i = 0;
+      rNavigation._setRouteOverrideProvider(() => sequence[Math.min(i++, sequence.length - 1)]);
+
+      mockNavigation.navigateToDynamicRoute();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      mockNavigation.navigateToCatchAllRoute();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('/posts/[...slug]');
+      expect(traceData[SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]).toBe('/profile/[id]');
+    });
+
+    // Regression test for #6436. React Navigation's BaseNavigationContainer
+    // fires `emit('state')` synchronously BEFORE the `onStateChange` prop
+    // callback, and Expo Router refreshes its router-store cache from that
+    // prop. Reading the override synchronously in the `state` listener would
+    // return the previous route for the current transition. The integration
+    // must defer the read until after the synchronous state-change chain has
+    // unwound.
+    it('reads the route override after the synchronous state-change chain (Expo Router ordering)', async () => {
+      const rNavigation = setupWithOverride();
+      jest.runOnlyPendingTimers();
+
+      // First navigation: settle on '/A' so the provider has a "previous" value.
+      let latestOverride: { templatedPath: string; params?: Record<string, unknown> } = {
+        templatedPath: '/A',
+      };
+      rNavigation._setRouteOverrideProvider(() => latestOverride);
+
+      mockNavigation.navigateToDynamicRoute();
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      // Second navigation: simulate the Expo Router ordering. When the `state`
+      // event fires the override provider still returns '/A' (Expo Router has
+      // not yet run its own `onStateChange` prop callback). Flip the provider
+      // to '/B' AFTER `navigateToCatchAllRoute()` returns but BEFORE the
+      // pending microtask flushes — this mimics `onStateChange` refreshing
+      // the store cache right after `emit('state')` returns.
+      mockNavigation.navigateToCatchAllRoute();
+      latestOverride = { templatedPath: '/B' };
+      jest.runOnlyPendingTimers();
+      await client.flush();
+
+      const traceData = client.event?.contexts?.trace?.data as Record<string, unknown>;
+      expect(client.event?.transaction).toBe('/B');
+      expect(traceData[SEMANTIC_ATTRIBUTE_ROUTE_NAME]).toBe('/B');
+      expect(traceData['route.path']).toBe('/B');
+      expect(traceData[SEMANTIC_ATTRIBUTE_PREVIOUS_ROUTE_NAME]).toBe('/A');
+    });
+  });
+
+  describe('dispatch breadcrumbs', () => {
+    let addBreadcrumbSpy: jest.SpyInstance;
+
+    beforeEach(() => {
+      addBreadcrumbSpy = jest.spyOn(core, 'addBreadcrumb');
+    });
+
+    afterEach(() => {
+      addBreadcrumbSpy.mockRestore();
+    });
+
+    it('includes action type and route name even when useDispatchedActionData is disabled', async () => {
+      setupTestClient();
+      mockNavigation.navigateToNewScreenWithPayload();
+      await jest.advanceTimersByTimeAsync(500);
+
+      expect(addBreadcrumbSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'navigation.dispatch',
+          type: 'navigation',
+          message: 'Dispatched NAVIGATE to New Screen',
+          data: expect.objectContaining({
+            action_type: 'NAVIGATE',
+            to: 'New Screen',
+          }),
+        }),
+      );
+    });
+
+    it('includes action type and route name when useDispatchedActionData is enabled', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      mockNavigation.navigateToNewScreenWithPayload();
+      await jest.advanceTimersByTimeAsync(500);
+
+      expect(addBreadcrumbSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'navigation.dispatch',
+          type: 'navigation',
+          message: 'Dispatched NAVIGATE to New Screen',
+          data: expect.objectContaining({
+            action_type: 'NAVIGATE',
+            to: 'New Screen',
+          }),
+        }),
+      );
+    });
+
+    it('creates dispatch breadcrumb without route name for GO_BACK', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      mockNavigation.emitGoBackWithStateChange();
+      await jest.advanceTimersByTimeAsync(500);
+
+      expect(addBreadcrumbSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'navigation.dispatch',
+          type: 'navigation',
+          message: 'Dispatched GO_BACK',
+          data: expect.objectContaining({
+            action_type: 'GO_BACK',
+          }),
+        }),
+      );
+    });
+
+    it('creates dispatch breadcrumb for filtered actions like SET_PARAMS', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: { type: 'SET_PARAMS' },
+          noop: false,
+          stack: undefined,
+        },
+      });
+      await jest.advanceTimersByTimeAsync(500);
+
+      expect(addBreadcrumbSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'navigation.dispatch',
+          message: 'Dispatched SET_PARAMS',
+          data: expect.objectContaining({
+            action_type: 'SET_PARAMS',
+          }),
+        }),
+      );
+    });
+
+    it('creates dispatch breadcrumb for drawer actions', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: { type: 'OPEN_DRAWER' },
+          noop: false,
+          stack: undefined,
+        },
+      });
+      await jest.advanceTimersByTimeAsync(500);
+
+      expect(addBreadcrumbSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'navigation.dispatch',
+          message: 'Dispatched OPEN_DRAWER',
+          data: expect.objectContaining({
+            action_type: 'OPEN_DRAWER',
+          }),
+        }),
+      );
+    });
+
+    it('does not create dispatch breadcrumb for noop actions when useDispatchedActionData is enabled', async () => {
+      setupTestClient({ useDispatchedActionData: true });
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: { type: 'NAVIGATE' },
+          noop: true,
+          stack: undefined,
+        },
+      });
+      await jest.advanceTimersByTimeAsync(500);
+
+      const dispatchCall = addBreadcrumbSpy.mock.calls.find(
+        (call: unknown[]) => (call[0] as { category?: string }).category === 'navigation.dispatch',
+      );
+      expect(dispatchCall).toBeUndefined();
+    });
+
+    it('does not create dispatch breadcrumb for noop actions when useDispatchedActionData is disabled', async () => {
+      setupTestClient();
+      mockNavigation.emitWithoutStateChange({
+        data: {
+          action: { type: 'NAVIGATE' },
+          noop: true,
+          stack: undefined,
+        },
+      });
+      await jest.advanceTimersByTimeAsync(500);
+
+      const dispatchCall = addBreadcrumbSpy.mock.calls.find(
+        (call: unknown[]) => (call[0] as { category?: string }).category === 'navigation.dispatch',
+      );
+      expect(dispatchCall).toBeUndefined();
+    });
+
+    it('still creates navigation breadcrumb on completed navigation', async () => {
+      setupTestClient();
+      mockNavigation.navigateToNewScreen();
+      await jest.advanceTimersByTimeAsync(500);
+
+      expect(addBreadcrumbSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          category: 'navigation',
+          type: 'navigation',
+          message: 'Navigation to New Screen',
+        }),
+      );
+    });
+
+    it('does not create dispatch breadcrumb for app restart', async () => {
+      const rNavigation = reactNavigationIntegration({ routeChangeTimeoutMs: 200 });
+      const rnTracing = reactNativeTracingIntegration();
+      const options = getDefaultTestClientOptions({
+        enableNativeFramesTracking: false,
+        enableStallTracking: false,
+        tracesSampleRate: 1.0,
+        integrations: [rNavigation, rnTracing],
+        enableAppStartTracking: false,
+      });
+      client = new TestClient(options);
+      setCurrentClient(client);
+      client.init();
+      mockNavigation = createMockNavigationAndAttachTo(rNavigation);
+
+      mockNavigation.finishAppStartNavigation();
+      await jest.advanceTimersByTimeAsync(500);
+
+      const dispatchCall = addBreadcrumbSpy.mock.calls.find(
+        (call: unknown[]) => (call[0] as { category?: string }).category === 'navigation.dispatch',
+      );
+      expect(dispatchCall).toBeUndefined();
+    });
+  });
+
+  function setupTestClient(
+    setupOptions: {
+      beforeSpanStart?: (options: StartSpanOptions) => StartSpanOptions;
+      useDispatchedActionData?: boolean;
+      sendDefaultPii?: boolean;
+    } = {},
+  ) {
+    const rNavigation = reactNavigationIntegration({
+      routeChangeTimeoutMs: 200,
+      useDispatchedActionData: setupOptions.useDispatchedActionData,
+    });
+    mockNavigation = createMockNavigationAndAttachTo(rNavigation);
+
+    const rnTracing = reactNativeTracingIntegration({
+      beforeStartSpan: setupOptions.beforeSpanStart,
+    });
+
+    const options = getDefaultTestClientOptions({
+      enableNativeFramesTracking: false,
+      enableStallTracking: false,
+      tracesSampleRate: 1.0,
+      integrations: [rNavigation, rnTracing],
+      enableAppStartTracking: false,
+      sendDefaultPii: setupOptions.sendDefaultPii,
+    });
+    client = new TestClient(options);
+    setCurrentClient(client);
+    client.init();
+  }
+});

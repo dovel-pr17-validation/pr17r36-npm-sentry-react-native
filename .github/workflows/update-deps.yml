@@ -1,0 +1,94 @@
+name: Update Dependencies
+
+on:
+  # Run every day.
+  schedule:
+    - cron: '0 3 * * *'
+  # And on on every PR merge so we get the updated dependencies ASAP, and to make sure the changelog doesn't conflict.
+  push:
+    branches:
+      - main
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-android.sh
+          name: Android SDK
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+  cocoa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-cocoa.sh
+          name: Cocoa SDK
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+  javascript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-javascript.sh
+          name: JavaScript SDK
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+  wizard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-wizard.sh
+          name: Wizard
+          changelog-entry: false
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+  cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-cli.sh
+          name: CLI
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+  sample-rn:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-rn.sh
+          name: React Native
+          pattern: '^v[0-9.]+$' # only match non-preview versions, also ignores "latest"
+          changelog-entry: false
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+  maestro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-maestro.sh
+          name: Maestro
+          pattern: '^v[0-9.]+$' # only match non-preview versions
+          changelog-entry: false
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}
+
+  sentry-android-gradle-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: getsentry/github-workflows/updater@959162c159b866489d3fabe93327f48f9b8cb7ee # v3
+        with:
+          path: scripts/update-sentry-android-gradle-plugin.sh
+          name: Sentry Android Gradle Plugin
+          pattern: '^[0-9.]+$'
+          changelog-entry: false
+          ssh-key: ${{ secrets.CI_DEPLOY_KEY }}

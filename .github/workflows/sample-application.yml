@@ -1,0 +1,745 @@
+name: Sample Application
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+  MAESTRO_VERSION: '2.12.1'
+  MAESTRO_DRIVER_STARTUP_TIMEOUT: 180000 # Increase timeout from default 30s to 180s for CI stability
+  RN_SENTRY_POD_NAME: RNSentry
+  IOS_APP_ARCHIVE_PATH: sentry-react-native-sample.app.zip
+  ANDROID_APP_ARCHIVE_PATH: sentry-react-native-sample.apk.zip
+  REACT_NATIVE_SAMPLE_PATH: samples/react-native
+  IOS_DEVICE: "iPhone 16"
+  IOS_VERSION: ">=18.0"
+  ANDROID_API_LEVEL: "30"
+
+jobs:
+  ready-to-merge-gate:
+    name: Ready-to-merge gate
+    uses: ./.github/workflows/ready-to-merge-workflow.yml
+    with:
+      is-pr: ${{ github.event_name == 'pull_request' }}
+      labels: ${{ toJson(github.event.pull_request.labels) }}
+
+  diff_check:
+    needs: [ready-to-merge-gate]
+    uses: ./.github/workflows/skip-ci.yml
+
+  detect-changes:
+    needs: [ready-to-merge-gate]
+    uses: ./.github/workflows/detect-changes.yml
+    with:
+      caller_event_name: ${{ github.event_name }}
+      caller_ref: ${{ github.ref }}
+
+  build-ios:
+    name: Build ${{ matrix.rn-architecture }} ios ${{ matrix.build-type }} ${{ matrix.ios-use-frameworks }}
+    runs-on: macos-26-xlarge
+    needs: [diff_check, detect-changes]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_ios == 'true')
+      }}
+    env:
+      SENTRY_DISABLE_AUTO_UPLOAD: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        rn-architecture: ["new"]
+        ios-use-frameworks: ["no-frameworks"]
+        build-type: ["dev", "production"]
+        # RNSentry vendors a prebuilt `Sentry.xcframework` downloaded from
+        # sentry-cocoa's release. sentry-cocoa dropped CocoaPods (trunk)
+        # support in 9.20.0, so the source-build fallback
+        # (`SENTRY_USE_XCFRAMEWORK=0`) can no longer resolve newer versions
+        # and is not exercised here.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1
+        with:
+          working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+          ruby-version: "3.3.0" # based on what is used in the sample
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+          cache-version: 1 # cache the installed gems
+
+      - name: Setup Global Xcode Tools
+        run: which xcbeautify || brew install xcbeautify
+
+      - name: Install SDK Dependencies
+        run: yarn install
+
+      - name: Build SDK
+        run: yarn build
+
+      - name: Install App Pods
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export ENABLE_PROD=1 || export ENABLE_PROD=0
+          [[ "${{ matrix.rn-architecture }}" == "new" ]] && export ENABLE_NEW_ARCH=1 || export ENABLE_NEW_ARCH=0
+          [[ "${{ matrix.ios-use-frameworks }}" == "dynamic-frameworks" ]] && export USE_FRAMEWORKS=dynamic
+
+          ./scripts/pod-install.sh
+
+      - name: Build iOS App
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        env:
+          # Fix for Xcode 26+ with MetalToolchain: use default Xcode toolchain to avoid
+          # missing Swift compatibility libraries (swiftCompatibility56, etc.)
+          # See: https://github.com/actions/runner-images/issues/13135
+          TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export CONFIG='Release' || export CONFIG='Debug'
+
+          ./scripts/set-dsn-ios.mjs
+          ./scripts/build-ios.sh
+
+      - name: Archive iOS App
+        if: ${{ matrix.rn-architecture == 'new' && matrix.build-type == 'production' && matrix.ios-use-frameworks == 'no-frameworks' }}
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: |
+          zip -r \
+            ${{ github.workspace }}/${{ env.IOS_APP_ARCHIVE_PATH }} \
+            sentryreactnativesample.app
+
+      - name: Upload iOS APP
+        if: ${{ matrix.rn-architecture == 'new' && matrix.build-type == 'production' && matrix.ios-use-frameworks == 'no-frameworks' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sample-rn-${{ matrix.rn-architecture }}-${{ matrix.build-type }}-${{ matrix.ios-use-frameworks}}-ios
+          path: ${{ env.IOS_APP_ARCHIVE_PATH }}
+          retention-days: 1
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: build-sample-${{ matrix.rn-architecture }}-ios-${{ matrix.build-type }}-${{ matrix.ios-use-frameworks}}-logs
+          path: ${{ env.REACT_NATIVE_SAMPLE_PATH }}/ios/*.log
+
+  build-android:
+    name: Build ${{ matrix.rn-architecture }} android ${{ matrix.build-type }}
+    runs-on: ubuntu-latest
+    needs: [diff_check, detect-changes]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_android == 'true')
+      }}
+    env:
+      SENTRY_DISABLE_AUTO_UPLOAD: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        rn-architecture: ["new"]
+        build-type: ["dev", "production"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable Corepack (NPM)
+        run: npm i -g corepack
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Gradle cache
+        uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6
+
+      - name: Install SDK Dependencies
+        run: yarn install
+
+      - name: Build SDK
+        run: yarn build
+
+      - name: Build Android App
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: |
+          export RN_ARCHITECTURE="${{ matrix.rn-architecture }}"
+          [[ "${{ matrix.build-type }}" == "production" ]] && export CONFIG='release' || export CONFIG='debug'
+
+          ./scripts/set-dsn-aos.mjs
+          # Split ABI coverage across the two matrix entries:
+          #   - `dev`        → subset (arm64-v8a only) so we can assert the module
+          #                    builds only the ABIs the app requested — the root
+          #                    cause of #6398 was hardcoded abiFilters ignoring
+          #                    `reactNativeArchitectures`.
+          #   - `production` → all four ABIs so the 16 KB alignment check below
+          #                    runs across every ABI (guards against #6394).
+          if [[ "${{ matrix.build-type }}" == "production" ]]; then
+            ./scripts/build-android.sh -PreactNativeArchitectures=armeabi-v7a,arm64-v8a,x86,x86_64
+          else
+            ./scripts/build-android.sh -PreactNativeArchitectures=arm64-v8a
+          fi
+
+      - name: Check libsentry-tm-perf-logger.so honors reactNativeArchitectures
+        if: ${{ matrix.build-type == 'dev' }}
+        # Asserts the module packaged our .so for exactly the subset the app
+        # requested — guards against regressing the #6398 root-cause fix.
+        run: ./scripts/check-tm-perf-logger-abi-subset.sh ${{ env.REACT_NATIVE_SAMPLE_PATH }}/app.apk 'arm64-v8a'
+
+      - name: Check 16 KB native library alignment
+        # Only Sentry-owned libraries are checked: third-party/React Native
+        # libraries are aligned by their own build (RN ships arm64 at 16 KB but
+        # x86 at 4 KB, and CI builds x86), so a whole-APK check is not
+        # meaningful here. Guards against regressing #6394.
+        run: ./scripts/check-android-16kb-alignment.sh ${{ env.REACT_NATIVE_SAMPLE_PATH }}/app.apk 'libsentry'
+
+      - name: Archive Android App
+        if: ${{ matrix.rn-architecture == 'new' && matrix.build-type == 'production' }}
+        run: |
+          zip -j \
+            ${{ env.ANDROID_APP_ARCHIVE_PATH }} \
+            ${{ env.REACT_NATIVE_SAMPLE_PATH }}/app.apk \
+            ${{ env.REACT_NATIVE_SAMPLE_PATH }}/app-androidTest.apk
+
+      - name: Upload Android APK
+        if: ${{ matrix.rn-architecture == 'new' && matrix.build-type == 'production' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: sample-rn-${{ matrix.rn-architecture }}-${{ matrix.build-type }}-android
+          path: ${{ env.ANDROID_APP_ARCHIVE_PATH }}
+          retention-days: 1
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: build-sample-${{ matrix.rn-architecture }}-android-${{ matrix.build-type }}-no-frameworks-logs
+          path: ${{ env.REACT_NATIVE_SAMPLE_PATH }}/android/*.log
+
+  build-macos:
+    name: Build legacy macos ${{ matrix.build-type }}
+    runs-on: macos-15-xlarge
+    needs: [diff_check, detect-changes]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_ios == 'true')
+      }}
+    env:
+      SENTRY_DISABLE_AUTO_UPLOAD: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: ["production"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1
+        with:
+          working-directory: samples/react-native-macos
+          ruby-version: "3.3.0" # based on what is used in the sample
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+          cache-version: 1 # cache the installed gems
+
+      - name: Setup Global Xcode Tools
+        run: which xcbeautify || brew install xcbeautify
+
+      - name: Install SDK Dependencies
+        run: yarn install
+
+      - name: Build SDK
+        run: yarn build
+
+      - name: Install App Pods
+        working-directory: samples/react-native-macos
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export ENABLE_PROD=1 || export ENABLE_PROD=0
+          export ENABLE_NEW_ARCH=0
+
+          ./scripts/pod-install.sh
+
+      - name: Build macOS App
+        working-directory: samples/react-native-macos/macos
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export CONFIG='Release' || export CONFIG='Debug'
+          echo "Building $CONFIG"
+          mkdir -p "DerivedData"
+          derivedData="$(realpath DerivedData)"
+          set -o pipefail && xcodebuild \
+            -workspace sentry-react-native-sample.xcworkspace \
+            -configuration "$CONFIG" \
+            -scheme sentry-react-native-sample-macOS \
+            -destination 'platform=macOS' \
+            ONLY_ACTIVE_ARCH=yes \
+            -derivedDataPath "$derivedData" \
+            build \
+            | tee xcodebuild.log \
+            | xcbeautify --quieter --is-ci --disable-colored-output
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: build-sample-legacy-macos-${{ matrix.build-type }}-no-frameworks-logs
+          path: samples/react-native-macos/macos/*.log
+
+  build-visionos:
+    name: Build new visionos ${{ matrix.build-type }}
+    # visionOS ships with Xcode 26; macos-26 runners have the visionOS
+    # Simulator SDK preinstalled, so a build-only job needs no runtime download.
+    runs-on: macos-26-xlarge
+    needs: [diff_check, detect-changes]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_ios == 'true')
+      }}
+    env:
+      SENTRY_DISABLE_AUTO_UPLOAD: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        # @callstack/react-native-visionos is New Architecture only.
+        build-type: ["production"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1
+        with:
+          working-directory: samples/react-native-visionos
+          ruby-version: "3.3.0" # based on what is used in the sample
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+          cache-version: 1 # cache the installed gems
+
+      - name: Setup Global Xcode Tools
+        run: which xcbeautify || brew install xcbeautify
+
+      - name: Install SDK Dependencies
+        run: yarn install
+
+      - name: Build SDK
+        run: yarn build
+
+      - name: Install App Pods
+        working-directory: samples/react-native-visionos
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export ENABLE_PROD=1 || export ENABLE_PROD=0
+          export ENABLE_NEW_ARCH=1
+
+          ./scripts/pod-install.sh
+
+      - name: Build visionOS App
+        working-directory: samples/react-native-visionos/visionos
+        env:
+          # Fix for Xcode 26+ with MetalToolchain: use default Xcode toolchain to avoid
+          # missing Swift compatibility libraries (swiftCompatibility56, etc.)
+          # See: https://github.com/actions/runner-images/issues/13135
+          TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export CONFIG='Release' || export CONFIG='Debug'
+          echo "Building $CONFIG"
+          # Build for a generic simulator destination — a compile gate only, so no
+          # booted simulator or runtime image is required. A separate derivedDataPath
+          # keeps pod-install's `build/generated/ios` codegen intact.
+          mkdir -p "DerivedData"
+          derivedData="$(realpath DerivedData)"
+          set -o pipefail && xcodebuild \
+            -workspace VisionSample.xcworkspace \
+            -configuration "$CONFIG" \
+            -scheme VisionSample \
+            -destination 'generic/platform=visionOS Simulator' \
+            ONLY_ACTIVE_ARCH=yes \
+            -derivedDataPath "$derivedData" \
+            build \
+            | tee xcodebuild.log \
+            | xcbeautify --quieter --is-ci --disable-colored-output
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: build-sample-new-visionos-${{ matrix.build-type }}-no-frameworks-logs
+          path: samples/react-native-visionos/visionos/*.log
+
+  build-tvos:
+    name: Build new tvos ${{ matrix.build-type }}
+    runs-on: macos-26-xlarge
+    needs: [diff_check, detect-changes]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_ios == 'true')
+      }}
+    env:
+      SENTRY_DISABLE_AUTO_UPLOAD: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        build-type: ["production"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1
+        with:
+          working-directory: samples/react-native-tvos
+          ruby-version: "3.3.0" # based on what is used in the sample
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+          cache-version: 1 # cache the installed gems
+
+      - name: Setup Global Xcode Tools
+        run: which xcbeautify || brew install xcbeautify
+
+      - name: Install SDK Dependencies
+        run: yarn install
+
+      - name: Build SDK
+        run: yarn build
+
+      - name: Install App Pods
+        working-directory: samples/react-native-tvos
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export ENABLE_PROD=1 || export ENABLE_PROD=0
+          export ENABLE_NEW_ARCH=1
+
+          ./scripts/pod-install.sh
+
+      - name: Build tvOS App
+        working-directory: samples/react-native-tvos/ios
+        env:
+          # Fix for Xcode 26+ with MetalToolchain: use default Xcode toolchain to avoid
+          # missing Swift compatibility libraries (swiftCompatibility56, etc.)
+          # See: https://github.com/actions/runner-images/issues/13135
+          TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export CONFIG='Release' || export CONFIG='Debug'
+          echo "Building $CONFIG"
+          mkdir -p "DerivedData"
+          derivedData="$(realpath DerivedData)"
+          set -o pipefail && xcodebuild \
+            -workspace TVOSSample.xcworkspace \
+            -configuration "$CONFIG" \
+            -scheme TVOSSample \
+            -destination 'generic/platform=tvOS Simulator' \
+            ONLY_ACTIVE_ARCH=yes \
+            -derivedDataPath "$derivedData" \
+            build \
+            | tee xcodebuild.log \
+            | xcbeautify --quieter --is-ci --disable-colored-output
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: build-sample-new-tvos-${{ matrix.build-type }}-no-frameworks-logs
+          path: samples/react-native-tvos/ios/*.log
+
+  build-catalyst:
+    name: Build new catalyst ${{ matrix.build-type }}
+    runs-on: macos-26-xlarge
+    needs: [diff_check, detect-changes]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_ios == 'true')
+      }}
+    env:
+      SENTRY_DISABLE_AUTO_UPLOAD: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        # Release only: under New Arch a Debug Catalyst link fails on third-party
+        # Fabric `getDebug*` symbols (an RN gap unrelated to Sentry) that `NDEBUG`
+        # strips in Release. Release exercises the #6755 slice selection.
+        build-type: ["production"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - uses: ruby/setup-ruby@de492cf36cbab201753d720ce4f4e336cd688c94 # v1
+        with:
+          working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+          ruby-version: "3.3.0" # based on what is used in the sample
+          bundler-cache: true # runs 'bundle install' and caches installed gems automatically
+          cache-version: 1 # cache the installed gems
+
+      - name: Setup Global Xcode Tools
+        run: which xcbeautify || brew install xcbeautify
+
+      - name: Install SDK Dependencies
+        run: yarn install
+
+      - name: Build SDK
+        run: yarn build
+
+      - name: Install App Pods
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export ENABLE_PROD=1 || export ENABLE_PROD=0
+          export ENABLE_NEW_ARCH=1
+          export ENABLE_MAC_CATALYST=1
+
+          ./scripts/pod-install.sh
+
+      - name: Build Mac Catalyst App
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}/ios
+        env:
+          # Fix for Xcode 26+ with MetalToolchain: use default Xcode toolchain to avoid
+          # missing Swift compatibility libraries (swiftCompatibility56, etc.)
+          # See: https://github.com/actions/runner-images/issues/13135
+          TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+        run: |
+          [[ "${{ matrix.build-type }}" == "production" ]] && export CONFIG='Release' || export CONFIG='Debug'
+          echo "Building $CONFIG"
+          # Catalyst builds under SDKROOT=macosx with IS_MACCATALYST=YES (there is
+          # no maccatalyst SDK) — the exact path #6755 regressed. Build-only gate:
+          # generic destination, no signing (the app target's manual signing is
+          # gated on [sdk=iphoneos*] and has no team).
+          mkdir -p "DerivedData"
+          derivedData="$(realpath DerivedData)"
+          set -o pipefail && xcodebuild \
+            -workspace sentryreactnativesample.xcworkspace \
+            -configuration "$CONFIG" \
+            -scheme sentryreactnativesample \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            ONLY_ACTIVE_ARCH=yes \
+            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$derivedData" \
+            build \
+            | tee xcodebuild.log \
+            | xcbeautify --quieter --is-ci --disable-colored-output
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: build-sample-new-catalyst-${{ matrix.build-type }}-no-frameworks-logs
+          path: ${{ env.REACT_NATIVE_SAMPLE_PATH }}/ios/*.log
+
+  test-ios:
+    name: Test ios production REV2
+    runs-on: ["bitrise_pool_name:tahoe"]
+    needs: [diff_check, detect-changes, build-ios]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_ios == 'true')
+      }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Maestro
+        uses: dniHze/maestro-test-action@bda8a93211c86d0a05b7a4597c5ad134566fbde4 # pin@v1.0.0
+        with:
+          version: ${{env.MAESTRO_VERSION}}
+
+      - name: Download iOS App Archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: sample-rn-new-production-no-frameworks-ios
+          path: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+
+      - name: Unzip iOS App Archive
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: unzip ${{ env.IOS_APP_ARCHIVE_PATH }}
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - name: Setup asdf Node.js (Bitrise)
+        run: |
+          asdf global nodejs system
+          corepack enable
+
+      - name: Install JS Dependencies
+        run: yarn install
+
+      - name: Boot ${{ env.IOS_DEVICE }} with iOS ${{ env.IOS_VERSION }}
+        uses: futureware-tech/simulator-action@c768f52966d5f70335ec77881f9806b24a52f80e # pin@v6
+        with:
+          model: ${{ env.IOS_DEVICE }}
+          os_version: ${{ env.IOS_VERSION }}
+          wait_for_boot: true
+          erase_before_boot: false
+
+      - name: Wait for iOS simulator to be fully ready
+        run: |
+          xcrun simctl bootstatus booted -b
+          xcrun simctl launch booted com.apple.Preferences
+          sleep 5
+          xcrun simctl terminate booted com.apple.Preferences
+
+      - name: Warm up Maestro driver on iOS
+        continue-on-error: true
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: |
+          xcrun simctl install booted sentryreactnativesample.app
+          WARMUP=$(mktemp /tmp/maestro-warmup-XXXXXX.yml)
+          cat > "$WARMUP" << 'YML'
+          appId: io.sentry.reactnative.sample
+          ---
+          - launchApp:
+              clearState: true
+          - extendedWaitUntil:
+              visible: "Sentry React Native Sample"
+              timeout: 120000
+          - killApp
+          YML
+          sed -i '' 's/^          //' "$WARMUP"
+          maestro test "$WARMUP" || true
+          rm -f "$WARMUP"
+
+      - name: Run iOS Tests
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: yarn test-ios
+
+  test-android:
+    name: Test android production REV2
+    runs-on: ubuntu-latest
+    needs: [diff_check, detect-changes, build-android]
+    if: >-
+      ${{
+        needs.diff_check.outputs.skip_ci != 'true'
+        && needs.detect-changes.outputs.needs_sample_react_native == 'true'
+        && (needs.detect-changes.outputs.sample_react_native == 'true' || needs.detect-changes.outputs.needs_android == 'true')
+      }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Maestro
+        uses: dniHze/maestro-test-action@bda8a93211c86d0a05b7a4597c5ad134566fbde4 # pin@v1.0.0
+        with:
+          version: ${{env.MAESTRO_VERSION}}
+
+      - name: Download Android APK
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: sample-rn-new-production-android
+          path: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+
+      - name: Unzip Android APK
+        working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+        run: |
+          unzip ${{ env.ANDROID_APP_ARCHIVE_PATH }}
+          rm app-androidTest.apk
+
+      - name: Enable Corepack (NPM)
+        run: npm i -g corepack
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          package-manager-cache: false
+          node-version: 22
+          cache: "yarn"
+          cache-dependency-path: yarn.lock
+
+      - name: Install JS Dependencies
+        run: yarn install
+
+      - uses: ./.github/actions/disk-cleanup
+
+      - name: Setup KVM
+        shell: bash
+        run: |
+          # check if virtualization is supported...
+          sudo apt install -y --no-install-recommends cpu-checker coreutils && echo "CPUs=$(nproc --all)" && kvm-ok
+          # allow access to KVM to run the emulator
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Android Tests on API ${{ env.ANDROID_API_LEVEL }}
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # pin@v2.38.0
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          force-avd-creation: false
+          disable-animations: true
+          disable-spellchecker: true
+          target: "aosp_atd"
+          channel: canary # Necessary for ATDs
+          disk-size: 4096M
+          emulator-options: >
+            -no-window
+            -no-snapshot-save
+            -gpu swiftshader_indirect
+            -noaudio
+            -no-boot-anim
+            -camera-back none
+            -camera-front none
+            -timezone US/Pacific
+          working-directory: ${{ env.REACT_NATIVE_SAMPLE_PATH }}
+          script: yarn test-android
